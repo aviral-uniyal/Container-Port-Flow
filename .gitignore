@@ -216,3 +216,89 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# =============================================================
+# Container-Port-Flow — project-specific additions
+# =============================================================
+
+# --- C++ build outputs (os-simulation) -----------------------
+os-simulation/build/
+os-simulation/bin/
+os-simulation/obj/
+*.o
+*.a
+*.out
+*.exe
+*.dll
+*.dylib
+*.dSYM/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+compile_commands.json
+
+# --- Node / React (frontend) ---------------------------------
+frontend/node_modules/
+frontend/.next/
+frontend/dist/
+frontend/build/
+frontend/.env.local
+frontend/.env.development.local
+frontend/.env.test.local
+frontend/.env.production.local
+frontend/npm-debug.log*
+frontend/yarn-debug.log*
+frontend/yarn-error.log*
+frontend/.pnp/
+frontend/.pnp.js
+.npm/
+
+# --- Environment & secrets -----------------------------------
+.env
+.env.*
+!.env.example
+secrets/
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.cer
+
+# --- ML model artifacts (large binary files) -----------------
+# Keep feature vectors and metadata; ignore trained model weights
+data/ml/*.pkl
+data/ml/*.joblib
+data/ml/*.h5
+data/ml/*.pt
+data/ml/*.pth
+data/ml/*.onnx
+data/ml/*.bin
+
+# --- Data directory policy -----------------------------------
+# Raw source data (Excel, CSV) — KEEP in version control if small enough.
+# Large files (> ~50 MB) should use Git LFS; never ignore the sources outright.
+# Processed and ML-ready datasets may grow large; ignore only heavyweight formats:
+data/processed/*.parquet
+data/processed/*.feather
+data/processed/*.hdf
+data/processed/*.h5
+# data/raw/ — intentionally not ignored; raw source files must be preserved.
+
+# --- Database & backend runtime files ------------------------
+*.sqlite3
+*.sqlite3-journal
+*.db
+backend/instance/
+backend/.env
+alembic.ini.bak
+migrations/__pycache__/
+
+# --- Misc editor / OS files ----------------------------------
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*.swo
+*~
