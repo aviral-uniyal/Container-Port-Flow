@@ -56,42 +56,58 @@ Output    : data/processed/port_calls_cleaned.csv
 ======================================================================
 
   Three-tier BCH treatment:
-    TIER 1 (C6)  Negative BCH          --> VALUE SET TO NaN (physically impossible)
-    TIER 2 (C7)  BCH > 500 bph (hard threshold) --> VALUE SET TO NaN (extreme error)
-    TIER 3       BCH > Tukey fence AND BCH <= 500 bph --> VALUE KEPT, flagged for review
+    TIER 1 (C6)  Negative BCH values:
+                 Flagged as questionable and set to missing (NaN) in the cleaned
+                 output (physically impossible for crane handling rate).
+    TIER 2 (C7)  Extreme outlier (BCH > 500 bph):
+                 Set to missing (NaN) in the cleaned output. 500 bph is a
+                 project-specific anomaly-handling threshold selected because
+                 the observed 617.86 bph value is exceptionally high relative
+                 to the other records. This threshold is not a verified physical
+                 or operational limit; the flagged value should be reviewed
+                 against the original source before being treated as erroneous.
+    TIER 3       Moderate positive outliers (BCH > Tukey fence AND <= 500 bph):
+                 Moderate positive outliers are preserved unchanged in the
+                 cleaned output and flagged for review.
 
   === Statistical fence (Tukey far-outlier, for tiers 2-3 reference) ===
   Only strictly positive BCH values are used to compute the fence.
-  Q1  (25th pct)  = 17.4358 bph
-  Q3  (75th pct)  = 22.7073 bph
-  IQR             = 5.2715 bph
-  Soft fence      = Q3 + 3*IQR = 38.5219 bph  (flag threshold)
-  Hard threshold  = 500.0 bph               (null threshold)
+  Q1  (25th pct)      = 17.4358 bph
+  Q3  (75th pct)      = 22.7073 bph
+  IQR                 = 5.2715 bph
+  Soft fence          = Q3 + 3*IQR = 38.5219 bph  (flag threshold)
+  Anomaly threshold   = 500.0 bph               (project-specific threshold)
 
   The original Excel workbook is NOT modified in any case.
 
-  --- TIER 1: Negative BCH -- VALUE SET TO NaN: 2 row(s) ---
-    Row  103  Vessel: CAHAYA NELLY                    BCH = -59.61 bph  [NULLED]
-    Row  710  Vessel: MERATUS JAYAPURA                BCH = -105.74 bph  [NULLED]
+  --- TIER 1: Negative BCH -- FLAGGED AS QUESTIONABLE & SET TO MISSING: 2 row(s) ---
+    Row  103  Vessel: CAHAYA NELLY                    BCH = -59.61 bph  [QUESTIONABLE -> SET TO MISSING]
+    Row  710  Vessel: MERATUS JAYAPURA                BCH = -105.74 bph  [QUESTIONABLE -> SET TO MISSING]
 
-  --- TIER 2: Extreme outlier (BCH > 500 bph) -- VALUE SET TO NaN: 1 row(s) ---
-    Row  744  Vessel: MERATUS SAMPIT                  BCH = 617.86 bph  [NULLED]
+  --- TIER 2: Extreme outlier (BCH > 500 bph) -- SET TO MISSING: 1 row(s) ---
+  Note: 500 bph is a project-specific anomaly-handling threshold selected because
+  the observed 617.86 bph value is exceptionally high relative to the other records.
+  This threshold is not a verified physical or operational limit; the flagged value
+  should be reviewed against the original source before being treated as erroneous.
+    Row  744  Vessel: MERATUS SAMPIT                  BCH = 617.86 bph  [EXTREME ANOMALY -> SET TO MISSING, REVIEW SOURCE]
 
-  --- TIER 3: Moderate outliers (Tukey fence, BCH > 38.52) -- VALUE KEPT: 8 row(s) ---
-  These rows are flagged for manual review but their BCH values are
-  preserved unchanged in the cleaned CSV.
-    Row  112  Vessel: BOW DIAMOND                     BCH = 120.00 bph  [KEPT, review recommended]
-    Row  146  Vessel: ELJOY                           BCH = 110.00 bph  [KEPT, review recommended]
-    Row  180  Vessel: CTP FORTUNE                     BCH = 44.99 bph  [KEPT, review recommended]
-    Row  260  Vessel: ULTRA AFRICA                    BCH = 170.00 bph  [KEPT, review recommended]
-    Row  324  Vessel: SINAR PAPUA                     BCH = 51.11 bph  [KEPT, review recommended]
-    Row  362  Vessel: HOUTMANGRACHT                   BCH = 66.67 bph  [KEPT, review recommended]
-    Row  603  Vessel: CTP MAKASSAR                    BCH = 38.74 bph  [KEPT, review recommended]
-    Row  676  Vessel: FLORA DELMAS                    BCH = 44.70 bph  [KEPT, review recommended]
+  --- TIER 3: Moderate positive outliers (Tukey fence, BCH > 38.52) -- PRESERVED & FLAGGED: 8 row(s) ---
+  These moderate positive outliers are preserved unchanged in the cleaned CSV
+  and flagged for review.
+    Row  112  Vessel: BOW DIAMOND                     BCH = 120.00 bph  [PRESERVED, FLAGGED FOR REVIEW]
+    Row  146  Vessel: ELJOY                           BCH = 110.00 bph  [PRESERVED, FLAGGED FOR REVIEW]
+    Row  180  Vessel: CTP FORTUNE                     BCH = 44.99 bph  [PRESERVED, FLAGGED FOR REVIEW]
+    Row  260  Vessel: ULTRA AFRICA                    BCH = 170.00 bph  [PRESERVED, FLAGGED FOR REVIEW]
+    Row  324  Vessel: SINAR PAPUA                     BCH = 51.11 bph  [PRESERVED, FLAGGED FOR REVIEW]
+    Row  362  Vessel: HOUTMANGRACHT                   BCH = 66.67 bph  [PRESERVED, FLAGGED FOR REVIEW]
+    Row  603  Vessel: CTP MAKASSAR                    BCH = 38.74 bph  [PRESERVED, FLAGGED FOR REVIEW]
+    Row  676  Vessel: FLORA DELMAS                    BCH = 44.70 bph  [PRESERVED, FLAGGED FOR REVIEW]
 
   Summary:
-    BCH values set to NaN : 3 (tier 1 negative + tier 2 extreme)
-    BCH values kept but flagged: 8 (tier 3 moderate)
+    Negative values flagged as questionable and set to missing : 2
+    Extreme outliers set to missing (subject to source review) : 1
+    Moderate positive outliers preserved and flagged for review: 8
+    Total BCH values set to missing in cleaned output           : 3
 
 ======================================================================
 8. DUPLICATE CHECK
@@ -115,7 +131,7 @@ Output    : data/processed/port_calls_cleaned.csv
   Row count check  : PASS
 
   Requirement: No replacement values invented for missing data.
-  Only BCH values that are negative or extreme outliers are nulled.
+  Only BCH values that are negative (questionable) or extreme outliers (500 bph anomaly threshold) are set to missing.
   All other NaN values from the original workbook are preserved as-is.
 
 ======================================================================

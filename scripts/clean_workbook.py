@@ -15,10 +15,18 @@ Cleaning rules applied (documented in cleaning_report.txt):
   C5  Derive a missing/invalid Week (ATD) value from the ATD date (ISO week)
       Convention: ISO 8601 week number of ATD (Python isocalendar()[1]).
       This matches the integer week values already present in the workbook.
-  C6  Flag negative BCH values -- set to NaN; no replacement values invented
-  C7  Flag extreme BCH outlier -- set to NaN
-      Rule: BCH > Q3 + 3*IQR  (Tukey far-outlier on strictly positive BCH)
-      The threshold is computed at runtime and logged to the cleaning report.
+  C6  Flag negative BCH values as questionable and set to missing (NaN) in
+      the cleaned output (no replacement values invented)
+  C7  BCH outlier handling (three-tier approach):
+      - Negative values flagged as questionable and set to missing (NaN)
+      - Extreme outlier: BCH > BCH_EXTREME_THRESHOLD (500.0 bph) set to missing
+        (NaN). 500 bph is a project-specific anomaly-handling threshold selected
+        because the observed 617.86 bph value is exceptionally high relative to
+        the other records. It is not a verified physical or operational limit,
+        and the flagged value should be reviewed against the original source
+        before being treated as erroneous.
+      - Moderate positive outliers (BCH > Tukey fence Q3 + 3*IQR and <= 500 bph)
+        are preserved in the cleaned output and flagged for review.
   C8  Preserve all 807 valid records including legitimate zero-TEU visits
   C9  Do not impute any other missing values
 
@@ -161,12 +169,19 @@ def derive_week_from_atd(df):
     return df, fixes
 
 
-# Hard threshold for nulling a single extreme BCH value.
-# The analysis identified one record (MERATUS SAMPIT, BCH=617.86 bph) that is
-# ~28x the median and almost certainly a formula error in the source workbook.
-# A 500 bph hard cutoff isolates this record unambiguously (the next highest
-# legitimate value in the data is ~170 bph).
-BCH_EXTREME_THRESHOLD = 500.0   # bph -- documented, not silent
+# Project-specific anomaly-handling threshold for extreme BCH values.
+# 500 bph is selected because the observed 617.86 bph value (MERATUS SAMPIT)
+# is exceptionally high relative to the other records (where the next highest
+# observed value is ~170 bph and median is ~21 bph).
+#
+# IMPORTANT: This threshold (500.0 bph) is NOT a verified physical or
+# operational limit. The flagged value should be reviewed against the original
+# source before being treated as erroneous.
+#
+# Negative BCH values are flagged as questionable and set to missing in the
+# cleaned output, while moderate positive outliers (up to 500 bph) are preserved
+# and flagged for review.
+BCH_EXTREME_THRESHOLD = 500.0   # bph -- project-specific anomaly threshold
 
 
 def flag_bch_problems(df):
@@ -175,21 +190,26 @@ def flag_bch_problems(df):
 
     Three tiers are applied (in order):
 
-    Tier 1 -- Negative BCH (C6)  -->  VALUE SET TO NaN
-      Physically impossible: a berth crane handling rate cannot be negative.
+    Tier 1 -- Negative BCH (C6)  -->  VALUE SET TO MISSING (NaN)
+      Negative BCH values are flagged as questionable and set to missing in
+      the cleaned output (a berth crane handling rate cannot physically be negative).
       Rows: CAHAYA NELLY (BCH=-59.61), MERATUS JAYAPURA (BCH=-105.74)
 
-    Tier 2 -- Extreme outlier (C7, hard threshold)  -->  VALUE SET TO NaN
-      Rule: BCH > BCH_EXTREME_THRESHOLD (500 bph)
-      This hard threshold is transparent and documented above.  It targets
-      exactly one record (MERATUS SAMPIT, BCH=617.86) whose value is ~28x the
-      median (21 bph) and is almost certainly a formula error.
+    Tier 2 -- Extreme outlier (C7, project-specific threshold)  -->  VALUE SET TO MISSING (NaN)
+      Rule: BCH > BCH_EXTREME_THRESHOLD (500.0 bph)
+      500 bph is a project-specific anomaly-handling threshold selected because
+      the observed 617.86 bph value (MERATUS SAMPIT) is exceptionally high
+      relative to the other records (where the next highest value is ~170 bph
+      and median is ~21 bph).
+      NOTE: This threshold is not a verified physical or operational limit; the
+      flagged value should be reviewed against the original source before being
+      treated as erroneous.
 
-    Tier 3 -- Moderate outliers (Tukey far fence, soft flag)  -->  VALUE KEPT
+    Tier 3 -- Moderate positive outliers (Tukey far fence)  -->  VALUE PRESERVED & FLAGGED
       Rule: BCH > Q3 + 3 * IQR  AND  BCH <= BCH_EXTREME_THRESHOLD
-      These values are statistically unusual but operationally plausible
-      (e.g. high-speed small-vessel operations).  They are listed in the
-      cleaning report for manual review but are NOT changed in the CSV.
+      Moderate positive outliers are preserved in the cleaned output and
+      flagged for review in the cleaning report (e.g. high-speed small-vessel
+      operations). They are NOT modified in the cleaned CSV.
 
     IMPORTANT: The original Excel workbook is NEVER modified.
                No replacement values are invented for nulled cells.
@@ -345,19 +365,29 @@ def write_cleaning_report(
     lines += [
         "",
         "  Three-tier BCH treatment:",
-        "    TIER 1 (C6)  Negative BCH          --> VALUE SET TO NaN (physically impossible)",
-        "    TIER 2 (C7)  BCH > {:.0f} bph (hard threshold) --> VALUE SET TO NaN (extreme error)".format(
+        "    TIER 1 (C6)  Negative BCH values:",
+        "                 Flagged as questionable and set to missing (NaN) in the cleaned",
+        "                 output (physically impossible for crane handling rate).",
+        "    TIER 2 (C7)  Extreme outlier (BCH > {:.0f} bph):".format(
             bch_report["extreme_threshold"]),
-        "    TIER 3       BCH > Tukey fence AND BCH <= {:.0f} bph --> VALUE KEPT, flagged for review".format(
+        "                 Set to missing (NaN) in the cleaned output. 500 bph is a",
+        "                 project-specific anomaly-handling threshold selected because",
+        "                 the observed 617.86 bph value is exceptionally high relative",
+        "                 to the other records. This threshold is not a verified physical",
+        "                 or operational limit; the flagged value should be reviewed",
+        "                 against the original source before being treated as erroneous.",
+        "    TIER 3       Moderate positive outliers (BCH > Tukey fence AND <= {:.0f} bph):".format(
             bch_report["extreme_threshold"]),
+        "                 Moderate positive outliers are preserved unchanged in the",
+        "                 cleaned output and flagged for review.",
         "",
         "  === Statistical fence (Tukey far-outlier, for tiers 2-3 reference) ===",
         "  Only strictly positive BCH values are used to compute the fence.",
-        "  Q1  (25th pct)  = {:.4f} bph".format(bch_report["q1"]),
-        "  Q3  (75th pct)  = {:.4f} bph".format(bch_report["q3"]),
-        "  IQR             = {:.4f} bph".format(bch_report["iqr"]),
-        "  Soft fence      = Q3 + 3*IQR = {:.4f} bph  (flag threshold)".format(bch_report["upper_fence"]),
-        "  Hard threshold  = {:.1f} bph               (null threshold)".format(
+        "  Q1  (25th pct)      = {:.4f} bph".format(bch_report["q1"]),
+        "  Q3  (75th pct)      = {:.4f} bph".format(bch_report["q3"]),
+        "  IQR                 = {:.4f} bph".format(bch_report["iqr"]),
+        "  Soft fence          = Q3 + 3*IQR = {:.4f} bph  (flag threshold)".format(bch_report["upper_fence"]),
+        "  Anomaly threshold   = {:.1f} bph               (project-specific threshold)".format(
             bch_report["extreme_threshold"]),
         "",
         "  The original Excel workbook is NOT modified in any case.",
@@ -365,39 +395,44 @@ def write_cleaning_report(
     ]
 
     neg = bch_report["negative_rows"]
-    lines.append("  --- TIER 1: Negative BCH -- VALUE SET TO NaN: {} row(s) ---".format(len(neg)))
+    lines.append("  --- TIER 1: Negative BCH -- FLAGGED AS QUESTIONABLE & SET TO MISSING: {} row(s) ---".format(len(neg)))
     for idx, vessel, bch in neg:
-        lines.append("    Row {:4d}  Vessel: {:<30s}  BCH = {:.2f} bph  [NULLED]".format(
+        lines.append("    Row {:4d}  Vessel: {:<30s}  BCH = {:.2f} bph  [QUESTIONABLE -> SET TO MISSING]".format(
             idx, vessel, bch))
 
     ext = bch_report["extreme_rows"]
     lines += [
         "",
-        "  --- TIER 2: Extreme outlier (BCH > {:.0f} bph) -- VALUE SET TO NaN: {} row(s) ---".format(
+        "  --- TIER 2: Extreme outlier (BCH > {:.0f} bph) -- SET TO MISSING: {} row(s) ---".format(
             bch_report["extreme_threshold"], len(ext)),
+        "  Note: 500 bph is a project-specific anomaly-handling threshold selected because",
+        "  the observed 617.86 bph value is exceptionally high relative to the other records.",
+        "  This threshold is not a verified physical or operational limit; the flagged value",
+        "  should be reviewed against the original source before being treated as erroneous.",
     ]
     for idx, vessel, bch in ext:
-        lines.append("    Row {:4d}  Vessel: {:<30s}  BCH = {:.2f} bph  [NULLED]".format(
+        lines.append("    Row {:4d}  Vessel: {:<30s}  BCH = {:.2f} bph  [EXTREME ANOMALY -> SET TO MISSING, REVIEW SOURCE]".format(
             idx, vessel, bch))
 
     soft = bch_report["soft_flag_rows"]
     lines += [
         "",
-        "  --- TIER 3: Moderate outliers (Tukey fence, BCH > {:.2f}) -- VALUE KEPT: {} row(s) ---".format(
+        "  --- TIER 3: Moderate positive outliers (Tukey fence, BCH > {:.2f}) -- PRESERVED & FLAGGED: {} row(s) ---".format(
             bch_report["upper_fence"], len(soft)),
-        "  These rows are flagged for manual review but their BCH values are",
-        "  preserved unchanged in the cleaned CSV.",
+        "  These moderate positive outliers are preserved unchanged in the cleaned CSV",
+        "  and flagged for review.",
     ]
     for idx, vessel, bch in soft:
-        lines.append("    Row {:4d}  Vessel: {:<30s}  BCH = {:.2f} bph  [KEPT, review recommended]".format(
+        lines.append("    Row {:4d}  Vessel: {:<30s}  BCH = {:.2f} bph  [PRESERVED, FLAGGED FOR REVIEW]".format(
             idx, vessel, bch))
 
     lines += [
         "",
         "  Summary:",
-        "    BCH values set to NaN : {} (tier 1 negative + tier 2 extreme)".format(
-            len(neg) + len(ext)),
-        "    BCH values kept but flagged: {} (tier 3 moderate)".format(len(soft)),
+        "    Negative values flagged as questionable and set to missing : {}".format(len(neg)),
+        "    Extreme outliers set to missing (subject to source review) : {}".format(len(ext)),
+        "    Moderate positive outliers preserved and flagged for review: {}".format(len(soft)),
+        "    Total BCH values set to missing in cleaned output           : {}".format(len(neg) + len(ext)),
     ]
 
     # 8. Duplicates
@@ -427,7 +462,7 @@ def write_cleaning_report(
         "  Row count check  : {}".format(ok),
         "",
         "  Requirement: No replacement values invented for missing data.",
-        "  Only BCH values that are negative or extreme outliers are nulled.",
+        "  Only BCH values that are negative (questionable) or extreme outliers (500 bph anomaly threshold) are set to missing.",
         "  All other NaN values from the original workbook are preserved as-is.",
     ]
 
@@ -493,13 +528,13 @@ def main():
         bch_report["upper_fence"]))
     print("[INFO] BCH hard threshold  : {:.1f} bph  (null threshold)".format(
         bch_report["extreme_threshold"]))
-    print("[INFO] Tier 1 -- negative BCH nulled   : {}".format(n_neg))
-    print("[INFO] Tier 2 -- extreme BCH nulled    : {}".format(n_ext))
-    print("[INFO] Tier 3 -- moderate BCH kept/flagged: {}".format(n_soft))
+    print("[INFO] Tier 1 -- negative BCH set to missing   : {}".format(n_neg))
+    print("[INFO] Tier 2 -- extreme BCH set to missing    : {}".format(n_ext))
+    print("[INFO] Tier 3 -- moderate BCH kept & flagged   : {}".format(n_soft))
     for idx, vessel, bch in bch_report["negative_rows"]:
-        print("       NULLED  (negative) : row {}, {}, BCH={:.2f}".format(idx, vessel, bch))
+        print("       MISSING (negative) : row {}, {}, BCH={:.2f}".format(idx, vessel, bch))
     for idx, vessel, bch in bch_report["extreme_rows"]:
-        print("       NULLED  (extreme)  : row {}, {}, BCH={:.2f}".format(idx, vessel, bch))
+        print("       MISSING (extreme)  : row {}, {}, BCH={:.2f} (review source)".format(idx, vessel, bch))
     for idx, vessel, bch in bch_report["soft_flag_rows"]:
         print("       FLAGGED (moderate) : row {}, {}, BCH={:.2f} [value preserved]".format(
             idx, vessel, bch))
@@ -538,7 +573,7 @@ def main():
     print("  Output rows        : {}".format(final_shape[0]))
     row_check = "OK" if final_shape[0] == 807 else "WARNING -- expected 807"
     print("  Row count check    : {}".format(row_check))
-    print("  BCH nulled         : {} negative + {} extreme = {} total".format(
+    print("  BCH set to missing : {} negative + {} extreme = {} total".format(
         n_neg, n_ext, n_neg + n_ext))
     print("  BCH flagged (kept) : {} moderate outliers (see cleaning_report.txt)".format(n_soft))
     print("  Cleaned CSV        : {}".format(CLEANED_CSV))
