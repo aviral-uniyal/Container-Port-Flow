@@ -228,7 +228,7 @@ def main() -> int:
         print(f"ERROR: CSV file not found: {CSV_PATH}", file=sys.stderr)
         return 1
 
-    with open(CSV_PATH, newline="", encoding="utf-8") as fh:
+    with open(CSV_PATH, newline="", encoding="utf-8-sig") as fh:
         reader = csv.DictReader(fh)
 
         # Validate headers against the expected mapping.
