@@ -1,0 +1,123 @@
+Container-Port-Flow -- Data Cleaning Report
+Generated : 2026-10-12 21:53:35
+Source    : data/raw/18 months Historical Data.xlsx
+Output    : data/processed/port_calls_cleaned.csv
+
+======================================================================
+1. ROW COUNTS
+======================================================================
+  Input rows (raw workbook)  : 810
+  Empty rows dropped (C1)    : 3
+  Output rows (cleaned CSV)  : 807
+  Columns in cleaned output  : 23
+
+======================================================================
+2. COLUMN NAME FIXES (C2)
+======================================================================
+  Renamed: 'ATB ' -> 'ATB'
+  Renamed: 'ATD ' -> 'ATD'
+
+======================================================================
+3. COMPLETELY EMPTY ROWS DROPPED (C1)
+======================================================================
+  Count    : 3
+  Criterion: Vessel Name IS NULL AND ATB IS NULL AND ATD IS NULL
+  Row #1: original Excel row index 296, No=628
+  Row #2: original Excel row index 297, No=629
+  Row #3: original Excel row index 586, No=630
+
+======================================================================
+4. STRING WHITESPACE STRIPPED (C3)
+======================================================================
+  Column 'Vessel Name': 220 cell(s) trimmed
+  Column 'OPR': 94 cell(s) trimmed
+  Column 'Month': 54 cell(s) trimmed
+  Column 'Week (ATD)': 806 cell(s) trimmed
+
+======================================================================
+5. MONTH NAME NORMALISATION (C4)
+======================================================================
+  Map applied:
+    'Nopember' -> 'November'  (22 row(s))
+
+  Note: Trailing-space variants ('Januari ', 'Oktober ', 'September ')
+        were resolved by the whitespace strip in step C3.
+
+======================================================================
+6. WEEK (ATD) DERIVATION (C5)
+======================================================================
+  Convention  : ISO 8601 week number of the ATD timestamp
+                pd.Timestamp(atd).isocalendar()[1] in Python
+  Rows fixed  : 1
+    Row 221: original value='S' -> derived week 38
+
+======================================================================
+7. BCH (ET) (bph) -- FLAGGED RECORDS (C6 AND C7)
+======================================================================
+
+  Three-tier BCH treatment:
+    TIER 1 (C6)  Negative BCH          --> VALUE SET TO NaN (physically impossible)
+    TIER 2 (C7)  BCH > 500 bph (hard threshold) --> VALUE SET TO NaN (extreme error)
+    TIER 3       BCH > Tukey fence AND BCH <= 500 bph --> VALUE KEPT, flagged for review
+
+  === Statistical fence (Tukey far-outlier, for tiers 2-3 reference) ===
+  Only strictly positive BCH values are used to compute the fence.
+  Q1  (25th pct)  = 17.4358 bph
+  Q3  (75th pct)  = 22.7073 bph
+  IQR             = 5.2715 bph
+  Soft fence      = Q3 + 3*IQR = 38.5219 bph  (flag threshold)
+  Hard threshold  = 500.0 bph               (null threshold)
+
+  The original Excel workbook is NOT modified in any case.
+
+  --- TIER 1: Negative BCH -- VALUE SET TO NaN: 2 row(s) ---
+    Row  103  Vessel: CAHAYA NELLY                    BCH = -59.61 bph  [NULLED]
+    Row  710  Vessel: MERATUS JAYAPURA                BCH = -105.74 bph  [NULLED]
+
+  --- TIER 2: Extreme outlier (BCH > 500 bph) -- VALUE SET TO NaN: 1 row(s) ---
+    Row  744  Vessel: MERATUS SAMPIT                  BCH = 617.86 bph  [NULLED]
+
+  --- TIER 3: Moderate outliers (Tukey fence, BCH > 38.52) -- VALUE KEPT: 8 row(s) ---
+  These rows are flagged for manual review but their BCH values are
+  preserved unchanged in the cleaned CSV.
+    Row  112  Vessel: BOW DIAMOND                     BCH = 120.00 bph  [KEPT, review recommended]
+    Row  146  Vessel: ELJOY                           BCH = 110.00 bph  [KEPT, review recommended]
+    Row  180  Vessel: CTP FORTUNE                     BCH = 44.99 bph  [KEPT, review recommended]
+    Row  260  Vessel: ULTRA AFRICA                    BCH = 170.00 bph  [KEPT, review recommended]
+    Row  324  Vessel: SINAR PAPUA                     BCH = 51.11 bph  [KEPT, review recommended]
+    Row  362  Vessel: HOUTMANGRACHT                   BCH = 66.67 bph  [KEPT, review recommended]
+    Row  603  Vessel: CTP MAKASSAR                    BCH = 38.74 bph  [KEPT, review recommended]
+    Row  676  Vessel: FLORA DELMAS                    BCH = 44.70 bph  [KEPT, review recommended]
+
+  Summary:
+    BCH values set to NaN : 3 (tier 1 negative + tier 2 extreme)
+    BCH values kept but flagged: 8 (tier 3 moderate)
+
+======================================================================
+8. DUPLICATE CHECK
+======================================================================
+  Exact full-row duplicates           : 0
+  Key-column duplicates (Vessel Name, ATB, ATD) : 0
+
+======================================================================
+9. MISSING VALUES IN CLEANED OUTPUT
+======================================================================
+  Column                               Null count
+  -----------------------------------  ----------
+  Week (ATD)                                  806
+  BCH (ET) (bph)                               71
+
+======================================================================
+10. PRESERVATION CHECKS
+======================================================================
+  Requirement: All 807 valid records must be preserved.
+  Output row count : 807
+  Row count check  : PASS
+
+  Requirement: No replacement values invented for missing data.
+  Only BCH values that are negative or extreme outliers are nulled.
+  All other NaN values from the original workbook are preserved as-is.
+
+======================================================================
+END OF REPORT
+======================================================================
