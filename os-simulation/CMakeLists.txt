@@ -35,3 +35,10 @@ target_link_libraries(deadlock_manager_lib PUBLIC resource_manager_lib)
 add_executable(deadlock_manager_tests tests/deadlock_manager_tests.cpp)
 target_link_libraries(deadlock_manager_tests PRIVATE deadlock_manager_lib)
 add_test(NAME DeadlockManagerTests COMMAND deadlock_manager_tests)
+
+# ─── Library (crane registry logic) ──────────────────────────────────────────
+add_library(crane_registry_lib src/crane_registry.cpp)
+
+add_executable(crane_registry_tests tests/crane_registry_tests.cpp)
+target_link_libraries(crane_registry_tests PRIVATE crane_registry_lib resource_manager_lib)
+add_test(NAME CraneRegistryTests COMMAND crane_registry_tests)
