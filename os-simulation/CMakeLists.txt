@@ -42,3 +42,19 @@ add_library(crane_registry_lib src/crane_registry.cpp)
 add_executable(crane_registry_tests tests/crane_registry_tests.cpp)
 target_link_libraries(crane_registry_tests PRIVATE crane_registry_lib resource_manager_lib)
 add_test(NAME CraneRegistryTests COMMAND crane_registry_tests)
+
+# ─── Library (disruption manager logic) ───────────────────────────────────────
+add_library(disruption_manager_lib src/disruption_manager.cpp)
+target_link_libraries(disruption_manager_lib PUBLIC crane_registry_lib)
+
+add_executable(disruption_manager_tests tests/disruption_manager_tests.cpp)
+target_link_libraries(disruption_manager_tests PRIVATE disruption_manager_lib resource_manager_lib)
+add_test(NAME DisruptionManagerTests COMMAND disruption_manager_tests)
+
+# ─── Library (port dispatcher — integration layer) ────────────────────────────
+add_library(port_dispatcher_lib src/port_dispatcher.cpp)
+target_link_libraries(port_dispatcher_lib PUBLIC disruption_manager_lib resource_manager_lib)
+
+add_executable(port_dispatcher_tests tests/port_dispatcher_tests.cpp)
+target_link_libraries(port_dispatcher_tests PRIVATE port_dispatcher_lib)
+add_test(NAME PortDispatcherTests COMMAND port_dispatcher_tests)
