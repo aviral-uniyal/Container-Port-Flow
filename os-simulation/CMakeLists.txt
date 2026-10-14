@@ -58,3 +58,14 @@ target_link_libraries(port_dispatcher_lib PUBLIC disruption_manager_lib resource
 add_executable(port_dispatcher_tests tests/port_dispatcher_tests.cpp)
 target_link_libraries(port_dispatcher_tests PRIVATE port_dispatcher_lib)
 add_test(NAME PortDispatcherTests COMMAND port_dispatcher_tests)
+
+# ─── JSON-Lines command interface ─────────────────────────────────────────────
+# Persistent process that communicates via JSON Lines on stdin/stdout.
+# Depends on port_dispatcher_lib (and transitively on all its dependencies).
+add_executable(port_json_iface src/port_json_iface.cpp)
+target_link_libraries(port_json_iface PRIVATE port_dispatcher_lib)
+
+# ─── JSON interface test suite ────────────────────────────────────────────────
+add_executable(port_json_iface_tests tests/port_json_iface_tests.cpp)
+target_link_libraries(port_json_iface_tests PRIVATE port_dispatcher_lib)
+add_test(NAME PortJsonIfaceTests COMMAND port_json_iface_tests)

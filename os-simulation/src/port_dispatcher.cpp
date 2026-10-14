@@ -332,6 +332,8 @@ void PortDispatcher::complete_job(const std::string& job_id) {
 
     release_job_resources(rec);
     rec.state = JobState::COMPLETED;
+    rec.work_completed = rec.job.work_total;
+    rec.work_remaining = 0;
 
     // Attempt to dispatch the next waiting job with the freed resources.
     try_dispatch();

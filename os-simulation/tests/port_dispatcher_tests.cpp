@@ -161,6 +161,8 @@ static bool test_complete_job_frees_and_dispatches() {
     pd.complete_job("J1");
 
     ASSERT_TRUE(pd.job_state("J1") == JobState::COMPLETED);
+    ASSERT_EQ(pd.job_record("J1").work_completed, 100);
+    ASSERT_EQ(pd.job_record("J1").work_remaining, 0);
     ASSERT_TRUE(pd.job_state("J2") == JobState::ACTIVE);  // dispatched on J1 completion
     return true;
 }
