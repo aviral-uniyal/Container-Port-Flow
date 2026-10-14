@@ -302,3 +302,9 @@ desktop.ini
 *.swp
 *.swo
 *~
+
+#Local VS Code settings
+.vscode/
+
+#Local database schema backup
+database/migrations/pre_migration_schema_backup.sql
