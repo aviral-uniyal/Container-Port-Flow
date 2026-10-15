@@ -339,7 +339,8 @@ class TestSimulationSchemaQueries:
         assert params["job_id"] == "JOB_A"
         assert params["work_total"] == 10
 
-    def test_update_job_status(self) -> None:
+    def test_update_job_status_rowcount(self) -> None:
+        """update_job_status returns True when a row is updated, False otherwise."""
         mock_conn = MagicMock()
         mock_cur = MagicMock()
         mock_conn.cursor.return_value.__enter__.return_value = mock_cur
@@ -351,6 +352,44 @@ class TestSimulationSchemaQueries:
         mock_cur.rowcount = 0
         not_found = update_job_status(mock_conn, run_id=42, job_id="JOB_MISSING", status="COMPLETED")
         assert not_found is False
+
+    def test_update_job_status_completed_sets_work_counters(self) -> None:
+        """COMPLETED status → SQL includes work_completed = work_total and work_remaining = 0."""
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_conn.cursor.return_value.__enter__.return_value = mock_cur
+        mock_cur.rowcount = 1
+
+        update_job_status(mock_conn, run_id=1, job_id="JOB_W", status="COMPLETED")
+
+        sql, params = mock_cur.execute.call_args[0]
+        # Work-counter CASE expressions must be present
+        assert "work_completed" in sql
+        assert "work_remaining" in sql
+        assert "work_total" in sql
+        # The status parameter is passed correctly
+        assert params["status"] == "COMPLETED"
+        assert params["run_id"] == 1
+        assert params["job_id"] == "JOB_W"
+
+    def test_update_job_status_non_completed_sql_has_work_counters_unchanged(self) -> None:
+        """Non-COMPLETED transitions still include the CASE clauses but leave counters unchanged."""
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_conn.cursor.return_value.__enter__.return_value = mock_cur
+        mock_cur.rowcount = 1
+
+        for status in ("ACTIVE", "CANCELLED", "PENDING"):
+            mock_cur.reset_mock()
+            update_job_status(mock_conn, run_id=1, job_id="JOB_X", status=status)
+            sql, params = mock_cur.execute.call_args[0]
+            # CASE clauses exist in SQL but the COMPLETED branch does not apply
+            assert "work_completed" in sql
+            assert "work_remaining" in sql
+            # The ELSE branches preserve existing values, not setting to 0 unconditionally
+            assert "ELSE work_completed" in sql
+            assert "ELSE work_remaining" in sql
+            assert params["status"] == status
 
     def test_get_jobs_for_run(self) -> None:
         mock_conn = MagicMock()

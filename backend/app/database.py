@@ -312,6 +312,10 @@ def update_job_status(
 ) -> bool:
     """Update the status of a simulation job.
 
+    When *status* is ``'COMPLETED'``, also sets ``work_completed = work_total``
+    and ``work_remaining = 0`` so the row accurately reflects full completion.
+    All other status transitions leave the work counters unchanged.
+
     Returns True if a row was updated, False if the (run_id, job_id) was
     not found.
     """
@@ -325,6 +329,14 @@ def update_job_status(
                started_at = CASE
                    WHEN %(status)s = 'ACTIVE' AND started_at IS NULL THEN now()
                    ELSE started_at
+               END,
+               work_completed = CASE
+                   WHEN %(status)s = 'COMPLETED' THEN work_total
+                   ELSE work_completed
+               END,
+               work_remaining = CASE
+                   WHEN %(status)s = 'COMPLETED' THEN 0
+                   ELSE work_remaining
                END
          WHERE run_id = %(run_id)s AND job_id = %(job_id)s
     """
