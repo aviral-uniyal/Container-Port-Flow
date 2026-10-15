@@ -460,3 +460,63 @@ def get_disruption_events_for_run(conn, run_id: int) -> list[dict[str, Any]]:
     with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
         cur.execute(sql, {"run_id": run_id})
         return [dict(row) for row in cur.fetchall()]
+
+
+# ── 6. Resource Inventory ──────────────────────────────────────────────────────
+
+
+def get_resource_inventory(conn) -> dict[str, list[dict[str, Any]]]:
+    """Return a snapshot of physical infrastructure from PostgreSQL.
+
+    Queries three tables in a single connection:
+      - terminals  : all terminal records
+      - berths     : all berth records (ordered by terminal then berth)
+      - cranes     : all crane records (ordered by terminal then crane_id)
+
+    ``updated_at`` on cranes is serialised to an ISO-8601 string so the
+    result is directly JSON-serialisable.
+
+    Returns a dict with keys ``"terminals"``, ``"berths"``, and ``"cranes"``,
+    each containing a list of row dicts.
+    """
+    terminals_sql = """
+        SELECT terminal_id, terminal_name, description
+          FROM terminals
+         ORDER BY terminal_id
+    """
+    berths_sql = """
+        SELECT berth_id, terminal_id, berth_name
+          FROM berths
+         ORDER BY terminal_id, berth_id
+    """
+    cranes_sql = """
+        SELECT crane_id, terminal_id, status, updated_at
+          FROM cranes
+         ORDER BY terminal_id, crane_id
+    """
+    result: dict[str, list[dict[str, Any]]] = {
+        "terminals": [],
+        "berths": [],
+        "cranes": [],
+    }
+
+    with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+        cur.execute(terminals_sql)
+        result["terminals"] = [dict(row) for row in cur.fetchall()]
+
+        cur.execute(berths_sql)
+        result["berths"] = [dict(row) for row in cur.fetchall()]
+
+        cur.execute(cranes_sql)
+        rows = cur.fetchall()
+
+    # Convert datetime objects to ISO strings so FastAPI can serialise them.
+    crane_list = []
+    for row in rows:
+        r = dict(row)
+        if r.get("updated_at") is not None:
+            r["updated_at"] = r["updated_at"].isoformat()
+        crane_list.append(r)
+    result["cranes"] = crane_list
+
+    return result

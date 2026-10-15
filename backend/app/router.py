@@ -20,6 +20,7 @@ from .cpp_bridge import CppBridgeError
 from .database import (
     check_connection,
     get_connection,
+    get_resource_inventory,
     insert_simulation_job,
     insert_simulation_run,
     update_job_status,
@@ -296,3 +297,29 @@ def simulation_snapshot(request: Request):
     """Return the full C++ simulation state snapshot."""
     bridge = _get_bridge(request)
     return _send(bridge, {"cmd": "snapshot"})
+
+
+@router.get("/inventory")
+def get_inventory(request: Request):
+    """Return physical infrastructure from PostgreSQL: terminals, berths, cranes.
+
+    This is a read-only endpoint that queries the database directly — it is
+    independent of the C++ simulation state.  Returns 503 when the database
+    pool is unavailable so callers can degrade gracefully.
+    """
+    pool = _get_db_pool(request)
+    if pool is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Database unavailable",
+        )
+    try:
+        with get_connection(pool) as conn:
+            data = get_resource_inventory(conn)
+    except Exception as exc:
+        logger.warning("GET /inventory DB error: %s", exc)
+        raise HTTPException(
+            status_code=503,
+            detail="Database error while fetching inventory",
+        )
+    return data

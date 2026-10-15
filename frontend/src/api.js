@@ -134,3 +134,17 @@ export async function fetchSnapshot() {
     return { ok: false, error: 'API unreachable' }
   }
 }
+
+/**
+ * GET /inventory — PostgreSQL-backed physical resource inventory.
+ * Returns { terminals, berths, cranes } from the database.
+ * Independent of the C++ simulation runtime state.
+ */
+export async function fetchInventory() {
+  try {
+    const res = await fetch('/inventory')
+    return handleResponse(res)
+  } catch {
+    return { ok: false, error: 'API unreachable' }
+  }
+}

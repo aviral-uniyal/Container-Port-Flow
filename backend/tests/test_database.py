@@ -20,6 +20,7 @@ from backend.app.database import (
     get_crane,
     get_disruption_events_for_run,
     get_jobs_for_run,
+    get_resource_inventory,
     get_simulation_run,
     insert_crane_assignment,
     insert_disruption_event,
@@ -447,3 +448,75 @@ class TestSimulationSchemaQueries:
         events = get_disruption_events_for_run(mock_conn, 42)
         assert len(events) == 1
         assert events[0]["event_id"] == 19
+
+
+# ─── 6. Resource Inventory Query tests ─────────────────────────────────────────
+
+
+class TestResourceInventoryQueries:
+    def test_get_resource_inventory_empty(self) -> None:
+        """Returns empty lists when database tables are empty."""
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_conn.cursor.return_value.__enter__.return_value = mock_cur
+        mock_cur.fetchall.side_effect = [[], [], []]
+
+        inv = get_resource_inventory(mock_conn)
+        assert inv == {
+            "terminals": [],
+            "berths": [],
+            "cranes": [],
+        }
+        assert mock_cur.execute.call_count == 3
+
+    def test_get_resource_inventory_populated(self) -> None:
+        """Returns terminals, berths, and cranes with ISO formatted updated_at."""
+        import datetime
+
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_conn.cursor.return_value.__enter__.return_value = mock_cur
+
+        ts = datetime.datetime(2026, 10, 15, 12, 0, 0, tzinfo=datetime.timezone.utc)
+        terminals = [
+            {"terminal_id": 1, "terminal_name": "Main Terminal", "description": "Primary container terminal"}
+        ]
+        berths = [
+            {"berth_id": 10, "terminal_id": 1, "berth_name": "Berth 1"}
+        ]
+        cranes = [
+            {"crane_id": "CR-1", "terminal_id": 1, "status": "AVAILABLE", "updated_at": ts},
+            {"crane_id": "CR-2", "terminal_id": 1, "status": "ASSIGNED", "updated_at": None},
+        ]
+        mock_cur.fetchall.side_effect = [terminals, berths, cranes]
+
+        inv = get_resource_inventory(mock_conn)
+        assert len(inv["terminals"]) == 1
+        assert inv["terminals"][0]["terminal_id"] == 1
+        assert inv["terminals"][0]["terminal_name"] == "Main Terminal"
+
+        assert len(inv["berths"]) == 1
+        assert inv["berths"][0]["berth_id"] == 10
+        assert inv["berths"][0]["berth_name"] == "Berth 1"
+
+        assert len(inv["cranes"]) == 2
+        assert inv["cranes"][0]["crane_id"] == "CR-1"
+        assert inv["cranes"][0]["updated_at"] == ts.isoformat()
+        assert inv["cranes"][1]["crane_id"] == "CR-2"
+        assert inv["cranes"][1]["updated_at"] is None
+
+        # Verify SQL queries targeted the expected tables
+        executed_sqls = [call[0][0] for call in mock_cur.execute.call_args_list]
+        assert any("FROM terminals" in sql for sql in executed_sqls)
+        assert any("FROM berths" in sql for sql in executed_sqls)
+        assert any("FROM cranes" in sql for sql in executed_sqls)
+
+    def test_get_resource_inventory_db_error(self) -> None:
+        """Database errors during execution are propagated."""
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_conn.cursor.return_value.__enter__.return_value = mock_cur
+        mock_cur.execute.side_effect = RuntimeError("DB connection dropped")
+
+        with pytest.raises(RuntimeError, match="DB connection dropped"):
+            get_resource_inventory(mock_conn)

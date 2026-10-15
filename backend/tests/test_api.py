@@ -84,7 +84,7 @@ class FakeCursor:
     def __exit__(self, exc_type, exc_val, exc_tb):
         pass
 
-    def execute(self, query: str) -> None:
+    def execute(self, query: str, *args, **kwargs) -> None:
         if not self.healthy:
             raise RuntimeError("Database query failed: connection reset")
 
@@ -93,6 +93,9 @@ class FakeCursor:
             return (1,)
         return None
 
+    def fetchall(self):
+        return []
+
 
 class FakeConn:
     def __init__(self, healthy: bool = True, fail_rollback: bool = False) -> None:
@@ -100,7 +103,7 @@ class FakeConn:
         self.fail_rollback = fail_rollback
         self.rollbacks = 0
 
-    def cursor(self):
+    def cursor(self, *args, **kwargs):
         return FakeCursor(healthy=self.healthy)
 
     def rollback(self) -> None:
@@ -972,3 +975,99 @@ class TestJobCompletionPersistence:
         assert "work_total" in sql, "SQL must reference work_total for COMPLETED branch"
         assert "ELSE work_completed" in sql, "non-COMPLETED branch must preserve work_completed"
         assert "ELSE work_remaining" in sql, "non-COMPLETED branch must preserve work_remaining"
+
+
+# ─── Endpoint: GET /inventory ─────────────────────────────────────────────────
+
+
+class TestInventoryEndpoint:
+    """Read-only physical infrastructure endpoint backed by PostgreSQL."""
+
+    def test_inventory_no_db_pool_returns_503(self):
+        """When db_pool is None, returns 503 Database unavailable."""
+        fake = FakeBridge()
+        app.state.bridge = fake
+        app.state.db_pool = None
+        client = TestClient(app, raise_server_exceptions=False)
+
+        resp = client.get("/inventory")
+        assert resp.status_code == 503
+        assert resp.json()["detail"] == "Database unavailable"
+
+    def test_inventory_db_pool_closed_returns_503(self):
+        """When db_pool is closed, returns 503 error."""
+        fake = FakeBridge()
+        pool = FakeDBPool(is_open=False)
+        client = _client(fake, pool)
+
+        resp = client.get("/inventory")
+        assert resp.status_code == 503
+        assert resp.json()["detail"] == "Database unavailable"
+
+    def test_inventory_db_exception_returns_503(self):
+        """When DB execution raises an error, returns 503."""
+        fake = FakeBridge()
+        pool = FakeDBPool(is_open=True, healthy=False)
+        client = _client(fake, pool)
+
+        resp = client.get("/inventory")
+        assert resp.status_code == 503
+        assert resp.json()["detail"] == "Database error while fetching inventory"
+
+    @patch("backend.app.router.get_resource_inventory")
+    @patch("backend.app.router.get_connection")
+    def test_inventory_success_returns_data(
+        self, mock_get_conn: MagicMock, mock_get_inv: MagicMock
+    ):
+        """Successful fetch returns 200 with terminals, berths, and cranes."""
+        mock_conn = MagicMock()
+        mock_get_conn.return_value.__enter__ = MagicMock(return_value=mock_conn)
+        mock_get_conn.return_value.__exit__ = MagicMock(return_value=False)
+        canned_inventory = {
+            "terminals": [
+                {"terminal_id": 1, "terminal_name": "Terminal Alpha", "description": "North Gate"}
+            ],
+            "berths": [
+                {"berth_id": 101, "terminal_id": 1, "berth_name": "B-01"}
+            ],
+            "cranes": [
+                {
+                    "crane_id": "CR-1",
+                    "terminal_id": 1,
+                    "status": "AVAILABLE",
+                    "updated_at": "2026-10-15T12:00:00+00:00",
+                }
+            ],
+        }
+        mock_get_inv.return_value = canned_inventory
+
+        fake = FakeBridge()
+        pool = FakeDBPool(is_open=True, healthy=True)
+        client = _client(fake, pool)
+
+        resp = client.get("/inventory")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["terminals"][0]["terminal_name"] == "Terminal Alpha"
+        assert data["berths"][0]["berth_name"] == "B-01"
+        assert data["cranes"][0]["crane_id"] == "CR-1"
+        mock_get_inv.assert_called_once_with(mock_conn)
+
+    @patch("backend.app.router.get_resource_inventory")
+    @patch("backend.app.router.get_connection")
+    def test_inventory_works_when_bridge_is_down(
+        self, mock_get_conn: MagicMock, mock_get_inv: MagicMock
+    ):
+        """Inventory is independent of C++ simulation runtime state."""
+        mock_conn = MagicMock()
+        mock_get_conn.return_value.__enter__ = MagicMock(return_value=mock_conn)
+        mock_get_conn.return_value.__exit__ = MagicMock(return_value=False)
+        mock_get_inv.return_value = {"terminals": [], "berths": [], "cranes": []}
+
+        fake = FakeBridge(alive=False)
+        pool = FakeDBPool(is_open=True, healthy=True)
+        client = _client(fake, pool)
+
+        resp = client.get("/inventory")
+        assert resp.status_code == 200
+        assert resp.json() == {"terminals": [], "berths": [], "cranes": []}

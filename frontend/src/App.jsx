@@ -5,8 +5,10 @@ import ResourceSummary  from './components/ResourceSummary'
 import JobForm          from './components/JobForm'
 import JobsTable        from './components/JobsTable'
 import CraneRegistry    from './components/CraneRegistry'
+import DatabaseInventory from './components/DatabaseInventory'
 import {
   fetchHealth,
+  fetchInventory,
   initSimulation,
   submitJob,
   completeJob,
@@ -34,6 +36,9 @@ export default function App() {
   const [jobs,             setJobs]             = useState([])
   const [cranes,           setCranes]           = useState([])
   const [loading,          setLoading]          = useState({})
+  const [inventory,        setInventory]        = useState(null)
+  const [inventoryLoading, setInventoryLoading] = useState(false)
+  const [inventoryError,   setInventoryError]   = useState(null)
 
   /* ── Helper: set loading flag for a given action key ── */
   function setBusy(key, busy) {
@@ -72,6 +77,19 @@ export default function App() {
     return result
   }, [applySnapshot])
 
+  /* ── Refresh PostgreSQL inventory ── */
+  const refreshInventory = useCallback(async () => {
+    setInventoryLoading(true)
+    setInventoryError(null)
+    const result = await fetchInventory()
+    setInventoryLoading(false)
+    if (result.ok) {
+      setInventory(result.data)
+    } else {
+      setInventoryError(result.error)
+    }
+  }, [])
+
   /* ── Health check on startup ── */
   useEffect(() => {
     async function checkHealth() {
@@ -100,9 +118,11 @@ export default function App() {
       if (h.bridge_alive) {
         await refreshSnapshot()
       }
+      // Always attempt inventory; endpoint returns 503 gracefully when DB is down
+      await refreshInventory()
     }
     checkHealth()
-  }, [refreshSnapshot])
+  }, [refreshSnapshot, refreshInventory])
 
   /* ── Initialize simulation ── */
   async function handleInit(formData) {
@@ -166,12 +186,16 @@ export default function App() {
       severity: 'ok',
     })
     await refreshSnapshot()
+    // Inventory reflects the new crane's persisted status
+    await refreshInventory()
   }
 
   /* ── Manual snapshot refresh ── */
   async function handleRefresh() {
     setBusy('refresh', true)
     const result = await refreshSnapshot()
+    // Also refresh DB inventory on manual refresh
+    await refreshInventory()
     setBusy('refresh', false)
     if (!result.ok) {
       setFeedback({ message: `Snapshot refresh failed: ${result.error}`, severity: 'err' })
@@ -225,6 +249,13 @@ export default function App() {
           cranes={cranes}
           onRegister={handleCraneRegister}
           disabled={loading.crane}
+        />
+
+        {/* Database Inventory — PostgreSQL physical resources */}
+        <DatabaseInventory
+          inventory={inventory}
+          loading={inventoryLoading}
+          error={inventoryError}
         />
 
       </main>
