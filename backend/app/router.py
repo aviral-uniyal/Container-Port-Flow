@@ -10,16 +10,28 @@ and maps responses / errors to appropriate HTTP status codes.
 
 from __future__ import annotations
 
+import logging
+from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
 
 from .cpp_bridge import CppBridgeError
+from .database import (
+    check_connection,
+    get_connection,
+    insert_simulation_job,
+    insert_simulation_run,
+    update_job_status,
+    upsert_crane,
+)
 from .models import (
     CraneRegisterRequest,
     InitRequest,
     JobSubmitRequest,
 )
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -62,16 +74,50 @@ def _send(bridge, command: dict[str, Any]) -> dict[str, Any]:
     return resp
 
 
+def _get_db_pool(request: Request):
+    """Return the database pool from app state, or *None* if unavailable."""
+    pool = getattr(request.app.state, "db_pool", None)
+    if pool is not None and getattr(pool, "is_open", False):
+        return pool
+    return None
+
+
 # ─── Endpoints ────────────────────────────────────────────────────────────────
 
 
 @router.get("/health")
 def health(request: Request):
-    """Report API and bridge liveness."""
+    """Report API, bridge, and database liveness."""
     bridge = getattr(request.app.state, "bridge", None)
     bridge_alive = bridge is not None and bridge.is_alive
-    status = "ready" if bridge_alive else "degraded"
-    return {"status": status, "bridge_alive": bridge_alive}
+
+    db_pool = getattr(request.app.state, "db_pool", None)
+    db_connected = False
+    if db_pool is not None and getattr(db_pool, "is_open", False):
+        conn = None
+        try:
+            conn = db_pool.getconn()
+            db_connected = check_connection(conn)
+        except Exception:
+            db_connected = False
+        finally:
+            if conn is not None:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                try:
+                    db_pool.putconn(conn)
+                except Exception:
+                    pass
+
+    all_ok = bridge_alive and db_connected
+    status = "ready" if all_ok else "degraded"
+    return {
+        "status": status,
+        "bridge_alive": bridge_alive,
+        "db_connected": db_connected,
+    }
 
 
 @router.post("/simulation/init")
@@ -86,7 +132,38 @@ def simulation_init(body: InitRequest, request: Request):
     }
     if body.policy is not None:
         cmd["policy"] = body.policy.value
-    return _send(bridge, cmd)
+    resp = _send(bridge, cmd)
+
+    # ── Persist simulation run ────────────────────────────────────────────
+    # Always reset current_run_id before attempting persistence so a failed
+    # run never inherits a stale ID from a previous initialization.
+    request.app.state.current_run_id = None
+    pool = _get_db_pool(request)
+    if pool is not None:
+        confirmed_policy = resp.get("policy", "FCFS")
+        now = datetime.now(timezone.utc)
+        run_name = f"Run {now.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3]}Z"
+        try:
+            with get_connection(pool) as conn:
+                run_id = insert_simulation_run(
+                    conn,
+                    run_name=run_name,
+                    scheduling_policy=confirmed_policy,
+                    total_berths=body.berths,
+                    total_cranes=body.cranes,
+                    total_trucks=body.trucks,
+                )
+            request.app.state.current_run_id = run_id
+            logger.info("Created simulation run %d (%s)", run_id, run_name)
+        except Exception as exc:
+            request.app.state.current_run_id = None
+            logger.warning("DB write failed for simulation init: %s", exc)
+    else:
+        logger.warning(
+            "No database pool available; skipping simulation run persistence"
+        )
+
+    return resp
 
 
 @router.post("/simulation/cranes")
@@ -97,7 +174,28 @@ def simulation_register_crane(body: CraneRegisterRequest, request: Request):
         "cmd": "register_crane",
         "crane_id": body.crane_id,
     }
-    return _send(bridge, cmd)
+    resp = _send(bridge, cmd)
+
+    # ── Persist crane registration ────────────────────────────────────────
+    pool = _get_db_pool(request)
+    if pool is not None:
+        try:
+            with get_connection(pool) as conn:
+                upsert_crane(
+                    conn,
+                    crane_id=body.crane_id,
+                    terminal_id=1,
+                    status="AVAILABLE",
+                )
+            logger.info("Persisted crane %s", body.crane_id)
+        except Exception as exc:
+            logger.warning("DB write failed for crane %s: %s", body.crane_id, exc)
+    else:
+        logger.warning(
+            "No database pool available; skipping crane persistence"
+        )
+
+    return resp
 
 
 @router.post("/simulation/jobs")
@@ -114,7 +212,42 @@ def simulation_submit_job(body: JobSubmitRequest, request: Request):
         "cranes": body.cranes,
         "trucks": body.trucks,
     }
-    return _send(bridge, cmd)
+    resp = _send(bridge, cmd)
+
+    # ── Persist submitted job ─────────────────────────────────────────────
+    run_id = getattr(request.app.state, "current_run_id", None)
+    if run_id is None:
+        logger.warning(
+            "No current_run_id; skipping job submission persistence for %s",
+            body.job_id,
+        )
+    else:
+        pool = _get_db_pool(request)
+        if pool is not None:
+            try:
+                with get_connection(pool) as conn:
+                    insert_simulation_job(
+                        conn,
+                        run_id=run_id,
+                        job_id=body.job_id,
+                        arrival_time=body.arrival_time,
+                        priority=body.priority,
+                        work_total=body.work_total,
+                        requested_berths=body.berths,
+                        requested_cranes=body.cranes,
+                        requested_trucks=body.trucks,
+                    )
+                logger.info("Persisted job %s for run %d", body.job_id, run_id)
+            except Exception as exc:
+                logger.warning(
+                    "DB write failed for job %s: %s", body.job_id, exc
+                )
+        else:
+            logger.warning(
+                "No database pool available; skipping job submission persistence"
+            )
+
+    return resp
 
 
 @router.post("/simulation/jobs/{job_id}/complete")
@@ -125,7 +258,37 @@ def simulation_complete_job(job_id: str, request: Request):
         "cmd": "complete_job",
         "job_id": job_id,
     }
-    return _send(bridge, cmd)
+    resp = _send(bridge, cmd)
+
+    # ── Persist completion status ─────────────────────────────────────────
+    run_id = getattr(request.app.state, "current_run_id", None)
+    if run_id is None:
+        logger.warning(
+            "No current_run_id; skipping job completion persistence for %s",
+            job_id,
+        )
+    else:
+        pool = _get_db_pool(request)
+        if pool is not None:
+            try:
+                with get_connection(pool) as conn:
+                    update_job_status(
+                        conn,
+                        run_id=run_id,
+                        job_id=job_id,
+                        status="COMPLETED",
+                    )
+                logger.info("Persisted completion for job %s run %d", job_id, run_id)
+            except Exception as exc:
+                logger.warning(
+                    "DB update failed for job %s completion: %s", job_id, exc
+                )
+        else:
+            logger.warning(
+                "No database pool available; skipping job completion persistence"
+            )
+
+    return resp
 
 
 @router.get("/simulation/snapshot")

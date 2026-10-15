@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Any
 
 # Repository root: backend/app/config.py  →  ../../
 _THIS_DIR = Path(__file__).resolve().parent          # backend/app/
@@ -28,3 +29,35 @@ def get_cpp_exe_path() -> Path:
     if env:
         return Path(env).resolve()
     return (REPO_ROOT / _DEFAULT_EXE_REL).resolve()
+
+
+# ─── Database configuration ──────────────────────────────────────────────────
+
+
+def get_db_config() -> dict[str, Any]:
+    """Return PostgreSQL connection parameters from environment variables.
+
+    Environment variables (with development defaults):
+        ``DATABASE_URL`` – optional full PostgreSQL DSN / URL.
+        ``PGHOST``       – database host        (default ``localhost``)
+        ``PGPORT``       – database port        (default ``5432``)
+        ``PGDATABASE``   – database name        (default ``container_port_flow``)
+        ``PGUSER``       – database user        (default ``postgres``)
+        ``PGPASSWORD``   – database password
+
+    Returns
+    -------
+    dict
+        Keyword arguments suitable for ``psycopg2.connect(**config)``.
+    """
+    database_url = os.environ.get("DATABASE_URL")
+    if database_url:
+        return {"dsn": database_url}
+
+    return {
+        "host":     os.environ.get("PGHOST", "localhost"),
+        "port":     int(os.environ.get("PGPORT", "5432")),
+        "dbname":   os.environ.get("PGDATABASE", "container_port_flow"),
+        "user":     os.environ.get("PGUSER", "postgres"),
+        "password": os.environ.get("PGPASSWORD"),
+    }
