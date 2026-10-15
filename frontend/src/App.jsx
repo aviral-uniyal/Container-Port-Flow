@@ -138,6 +138,7 @@ export default function App() {
       severity: 'ok',
     })
     await refreshSnapshot()
+    await refreshInventory()
   }
 
   /* ── Submit job ── */
@@ -154,6 +155,7 @@ export default function App() {
       severity: 'ok',
     })
     await refreshSnapshot()
+    await refreshInventory()
   }
 
   /* ── Complete job ── */
@@ -170,6 +172,7 @@ export default function App() {
       severity: 'ok',
     })
     await refreshSnapshot()
+    await refreshInventory()
   }
 
   /* ── Register crane ── */

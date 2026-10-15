@@ -102,9 +102,13 @@ class FakeConn:
         self.healthy = healthy
         self.fail_rollback = fail_rollback
         self.rollbacks = 0
+        self.commits = 0
 
     def cursor(self, *args, **kwargs):
         return FakeCursor(healthy=self.healthy)
+
+    def commit(self) -> None:
+        self.commits += 1
 
     def rollback(self) -> None:
         if self.fail_rollback:
@@ -165,6 +169,7 @@ def _client(
         db_pool = FakeDBPool()
     app.state.bridge = bridge
     app.state.db_pool = db_pool
+    app.state.current_run_id = None
     return TestClient(app, raise_server_exceptions=False)
 
 
@@ -696,8 +701,8 @@ class TestCranePersistence:
 
     @patch("backend.app.router.upsert_crane")
     def test_crane_cpp_failure_does_not_persist(self, mock_upsert: MagicMock):
-        """Failed C++ registration → upsert_crane never called."""
-        fake = FakeBridge(response={"ok": False, "error": "duplicate crane"})
+        """Genuine C++ registration failure (non-duplicate) → upsert_crane never called."""
+        fake = FakeBridge(response={"ok": False, "error": "dispatcher not initialised; send init first"})
         pool = FakeDBPool(is_open=True, healthy=True)
         client = _client(fake, pool)
 
@@ -705,6 +710,31 @@ class TestCranePersistence:
 
         assert resp.status_code == 400
         mock_upsert.assert_not_called()
+
+    @patch("backend.app.router.upsert_crane")
+    @patch("backend.app.router.get_connection")
+    def test_crane_duplicate_registration_is_idempotent(
+        self, mock_get_conn: MagicMock, mock_upsert: MagicMock
+    ):
+        """Duplicate C++ registration is idempotent: returns 200 OK and upserts DB record."""
+        mock_conn = MagicMock()
+        mock_get_conn.return_value.__enter__ = MagicMock(return_value=mock_conn)
+        mock_get_conn.return_value.__exit__ = MagicMock(return_value=False)
+        mock_upsert.return_value = "C1"
+
+        fake = FakeBridge(response={"ok": False, "error": "Duplicate crane ID: C1"})
+        pool = FakeDBPool(is_open=True, healthy=True)
+        client = _client(fake, pool)
+
+        resp = client.post("/simulation/cranes", json={"crane_id": "C1"})
+
+        assert resp.status_code == 200
+        assert resp.json()["ok"] is True
+        assert resp.json()["crane_id"] == "C1"
+        mock_upsert.assert_called_once()
+        call_kwargs = mock_upsert.call_args[1]
+        assert call_kwargs["crane_id"] == "C1"
+        assert call_kwargs["status"] == "AVAILABLE"
 
 
 # ─── Persistence: POST /simulation/jobs ───────────────────────────────────────
@@ -829,6 +859,47 @@ class TestJobSubmissionPersistence:
 
         assert resp.status_code == 400
         mock_insert.assert_not_called()
+
+    @patch("backend.app.router.batch_sync_crane_statuses")
+    @patch("backend.app.router.insert_simulation_job")
+    @patch("backend.app.router.get_connection")
+    def test_job_submission_syncs_assigned_crane_statuses(
+        self, mock_get_conn: MagicMock, mock_insert: MagicMock, mock_batch_sync: MagicMock
+    ):
+        """Job submission dispatches cranes → crane statuses synced to PostgreSQL."""
+        mock_conn = MagicMock()
+        mock_get_conn.return_value.__enter__ = MagicMock(return_value=mock_conn)
+        mock_get_conn.return_value.__exit__ = MagicMock(return_value=False)
+        mock_insert.return_value = 101
+
+        snapshot_data = {
+            "ok": True,
+            "cranes": [
+                {"crane_id": "C1", "status": "ASSIGNED", "assigned_job": "J1"},
+                {"crane_id": "CRANE_DEMO_01", "status": "ASSIGNED", "assigned_job": "J1"},
+            ],
+        }
+        submit_data = {"ok": True, "job_id": "J1", "state": "ACTIVE"}
+
+        class MultiResponseBridge(FakeBridge):
+            def send(self, command: dict[str, Any]) -> dict[str, Any]:
+                self.last_command = command
+                if command.get("cmd") == "snapshot":
+                    return snapshot_data
+                return submit_data
+
+        fake = MultiResponseBridge()
+        pool = FakeDBPool(is_open=True, healthy=True)
+        client = _client(fake, pool)
+        app.state.current_run_id = 42
+
+        resp = client.post("/simulation/jobs", json=self._VALID_JOB)
+
+        assert resp.status_code == 200
+        mock_batch_sync.assert_called_once()
+        synced = mock_batch_sync.call_args[0][1]
+        assert {"crane_id": "C1", "status": "ASSIGNED"} in synced
+        assert {"crane_id": "CRANE_DEMO_01", "status": "ASSIGNED"} in synced
 
 
 # ─── Persistence: POST /simulation/jobs/{job_id}/complete ─────────────────────
@@ -975,6 +1046,47 @@ class TestJobCompletionPersistence:
         assert "work_total" in sql, "SQL must reference work_total for COMPLETED branch"
         assert "ELSE work_completed" in sql, "non-COMPLETED branch must preserve work_completed"
         assert "ELSE work_remaining" in sql, "non-COMPLETED branch must preserve work_remaining"
+
+    @patch("backend.app.router.batch_sync_crane_statuses")
+    @patch("backend.app.router.update_job_status")
+    @patch("backend.app.router.get_connection")
+    def test_job_completion_syncs_released_crane_statuses(
+        self, mock_get_conn: MagicMock, mock_update: MagicMock, mock_batch_sync: MagicMock
+    ):
+        """Job completion releases cranes → crane statuses synced back to AVAILABLE."""
+        mock_conn = MagicMock()
+        mock_get_conn.return_value.__enter__ = MagicMock(return_value=mock_conn)
+        mock_get_conn.return_value.__exit__ = MagicMock(return_value=False)
+        mock_update.return_value = True
+
+        snapshot_data = {
+            "ok": True,
+            "cranes": [
+                {"crane_id": "C1", "status": "AVAILABLE", "assigned_job": ""},
+                {"crane_id": "CRANE_DEMO_01", "status": "AVAILABLE", "assigned_job": ""},
+            ],
+        }
+        complete_data = {"ok": True, "job_id": "J1", "state": "COMPLETED"}
+
+        class MultiResponseBridge(FakeBridge):
+            def send(self, command: dict[str, Any]) -> dict[str, Any]:
+                self.last_command = command
+                if command.get("cmd") == "snapshot":
+                    return snapshot_data
+                return complete_data
+
+        fake = MultiResponseBridge()
+        pool = FakeDBPool(is_open=True, healthy=True)
+        client = _client(fake, pool)
+        app.state.current_run_id = 42
+
+        resp = client.post("/simulation/jobs/J1/complete")
+
+        assert resp.status_code == 200
+        mock_batch_sync.assert_called_once()
+        synced = mock_batch_sync.call_args[0][1]
+        assert {"crane_id": "C1", "status": "AVAILABLE"} in synced
+        assert {"crane_id": "CRANE_DEMO_01", "status": "AVAILABLE"} in synced
 
 
 # ─── Endpoint: GET /inventory ─────────────────────────────────────────────────

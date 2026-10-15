@@ -18,11 +18,13 @@ from fastapi import APIRouter, HTTPException, Request
 
 from .cpp_bridge import CppBridgeError
 from .database import (
+    batch_sync_crane_statuses,
     check_connection,
     get_connection,
     get_resource_inventory,
     insert_simulation_job,
     insert_simulation_run,
+    update_crane_status,
     update_job_status,
     upsert_crane,
 )
@@ -81,6 +83,72 @@ def _get_db_pool(request: Request):
     if pool is not None and getattr(pool, "is_open", False):
         return pool
     return None
+
+
+def _sync_crane_statuses(bridge, request: Request) -> None:
+    """Take a C++ snapshot and persist all crane statuses to PostgreSQL.
+
+    This is the core of Bug 2's fix.  The C++ runtime is the authoritative
+    source for per-crane status (AVAILABLE / ASSIGNED / FAILED).  After any
+    operation that may change crane statuses (job submission that triggers
+    dispatch, or job completion that releases cranes) we snapshot the C++
+    registry and batch-update the ``cranes`` table so Database Inventory
+    reflects the real runtime state.
+
+    Design decisions:
+    - Only updates cranes that already exist in the DB (batch_sync skips
+      unknown IDs), so we never create phantom rows.
+    - Errors are caught and logged; they must NOT propagate back to the
+      caller since the primary C++ operation has already succeeded.
+    - If the snapshot itself fails (bridge error) we log a warning and
+      return without persisting — the next manual refresh will catch up.
+    """
+    pool = _get_db_pool(request)
+    if pool is None:
+        return  # No DB available — nothing to sync.
+
+    # Only sync runtime crane status if a simulation run is active
+    if getattr(request.app.state, "current_run_id", None) is None:
+        return
+
+    try:
+        snap = bridge.send({"cmd": "snapshot"})
+    except Exception as exc:
+        logger.warning("Could not take snapshot for crane status sync: %s", exc)
+        return
+
+    if not snap.get("ok", False):
+        logger.warning(
+            "Snapshot returned ok=false during crane status sync: %s",
+            snap.get("error", ""),
+        )
+        return
+
+    cranes_list = snap.get("cranes", [])
+    if not cranes_list:
+        return
+
+    # Build a list of {crane_id, status} dicts from the snapshot.
+    crane_statuses = []
+    for c in cranes_list:
+        cid = c.get("crane_id", "")
+        status = c.get("status", "")
+        if cid and status in ("AVAILABLE", "ASSIGNED", "FAILED"):
+            crane_statuses.append({"crane_id": cid, "status": status})
+
+    if not crane_statuses:
+        return
+
+    try:
+        with get_connection(pool) as conn:
+            updated = batch_sync_crane_statuses(conn, crane_statuses)
+        logger.info(
+            "Synced crane statuses from C++ snapshot: %d/%d rows updated",
+            updated,
+            len(crane_statuses),
+        )
+    except Exception as exc:
+        logger.warning("DB write failed during crane status sync: %s", exc)
 
 
 # ─── Endpoints ────────────────────────────────────────────────────────────────
@@ -169,33 +237,70 @@ def simulation_init(body: InitRequest, request: Request):
 
 @router.post("/simulation/cranes")
 def simulation_register_crane(body: CraneRegisterRequest, request: Request):
-    """Register a crane with the C++ dispatcher."""
+    """Register a crane with the C++ dispatcher.
+
+    Idempotent: if the crane is already registered in the current C++ session
+    (i.e. C++ returns a duplicate-crane error), the handler still upserts the
+    crane record in PostgreSQL and returns HTTP 200.  This prevents stale DB
+    entries when a crane was registered in a previous session but the C++
+    process was restarted without clearing the database.
+    """
     bridge = _get_bridge(request)
+    crane_id = body.crane_id.strip()
     cmd: dict[str, Any] = {
         "cmd": "register_crane",
-        "crane_id": body.crane_id,
+        "crane_id": crane_id,
     }
-    resp = _send(bridge, cmd)
 
-    # ── Persist crane registration ────────────────────────────────────────
+    try:
+        resp = bridge.send(cmd)
+    except CppBridgeError:
+        raise HTTPException(
+            status_code=503,
+            detail="C++ simulation bridge is unavailable",
+        )
+
+    # Bug 1 fix: C++ CraneRegistry rejects re-registration of an already-known
+    # crane with "Duplicate crane ID: ...".  From the API perspective this is
+    # idempotent — the crane is already AVAILABLE in the runtime and the DB
+    # ON CONFLICT clause will simply update updated_at.  We persist and return
+    # 200 so callers do not have to distinguish "registered now" vs "already
+    # registered" and the DB row is always kept in sync.
+    is_duplicate = (
+        not resp.get("ok", False)
+        and "duplicate crane" in resp.get("error", "").lower()
+    )
+
+    if not resp.get("ok", False) and not is_duplicate:
+        # Genuine C++ rejection (not a duplicate) — propagate as 400.
+        raise HTTPException(
+            status_code=400,
+            detail=resp.get("error", "C++ command rejected"),
+        )
+
+    # ── Persist crane registration (new or duplicate) ──────────────────────
     pool = _get_db_pool(request)
     if pool is not None:
         try:
             with get_connection(pool) as conn:
                 upsert_crane(
                     conn,
-                    crane_id=body.crane_id,
+                    crane_id=crane_id,
                     terminal_id=1,
                     status="AVAILABLE",
                 )
-            logger.info("Persisted crane %s", body.crane_id)
+            logger.info("Persisted crane %s (duplicate=%s)", crane_id, is_duplicate)
         except Exception as exc:
-            logger.warning("DB write failed for crane %s: %s", body.crane_id, exc)
+            logger.warning("DB write failed for crane %s: %s", crane_id, exc)
     else:
         logger.warning(
             "No database pool available; skipping crane persistence"
         )
 
+    # Return a normalised ok response for duplicates so the frontend treats
+    # re-registration as a success.
+    if is_duplicate:
+        return {"ok": True, "crane_id": crane_id}
     return resp
 
 
@@ -248,6 +353,13 @@ def simulation_submit_job(body: JobSubmitRequest, request: Request):
                 "No database pool available; skipping job submission persistence"
             )
 
+    # ── Bug 2 fix: sync crane statuses ───────────────────────────────────
+    # A job submission may immediately dispatch the job (PENDING → ACTIVE),
+    # causing cranes to transition AVAILABLE → ASSIGNED in the C++ runtime.
+    # We take a snapshot right after and persist the current crane statuses
+    # to PostgreSQL so Database Inventory reflects the real assignment state.
+    _sync_crane_statuses(bridge, request)
+
     return resp
 
 
@@ -288,6 +400,11 @@ def simulation_complete_job(job_id: str, request: Request):
             logger.warning(
                 "No database pool available; skipping job completion persistence"
             )
+
+    # ── Bug 2 fix: sync crane statuses ───────────────────────────────────
+    # Job completion releases all assigned cranes back to AVAILABLE in C++.
+    # Sync the snapshot so Database Inventory shows them as AVAILABLE again.
+    _sync_crane_statuses(bridge, request)
 
     return resp
 

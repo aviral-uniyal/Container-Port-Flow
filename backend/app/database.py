@@ -204,6 +204,61 @@ def get_crane(conn, crane_id: str) -> dict[str, Any] | None:
         return dict(row) if row else None
 
 
+def update_crane_status(conn, *, crane_id: str, status: str) -> bool:
+    """Update the status of an existing crane record.
+
+    Only touches the ``status`` and ``updated_at`` columns — it does NOT
+    alter ``terminal_id`` or any other field.  This is the correct helper
+    for reflecting runtime state transitions (AVAILABLE → ASSIGNED → AVAILABLE)
+    without overwriting registration metadata.
+
+    Status must be one of: 'AVAILABLE', 'ASSIGNED', 'FAILED'.
+
+    Returns True if a row was updated, False if the crane_id was not found.
+    """
+    sql = """
+        UPDATE cranes
+           SET status     = %(status)s,
+               updated_at = now()
+         WHERE crane_id = %(crane_id)s
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql, {"crane_id": crane_id, "status": status})
+        return cur.rowcount > 0
+
+
+def batch_sync_crane_statuses(
+    conn,
+    crane_statuses: list[dict[str, str]],
+) -> int:
+    """Sync crane status for each entry in *crane_statuses*.
+
+    Each dict must have ``crane_id`` and ``status`` keys.  Only cranes that
+    already exist in the database are updated — unknown IDs are silently
+    skipped (they may not have been registered in the DB yet).
+
+    Returns the number of rows actually updated.
+
+    This is used to persist runtime state (ASSIGNED / AVAILABLE transitions)
+    from the C++ snapshot into PostgreSQL so that Database Inventory reflects
+    the real simulation state.
+    """
+    if not crane_statuses:
+        return 0
+    updated = 0
+    sql = """
+        UPDATE cranes
+           SET status     = %(status)s,
+               updated_at = now()
+         WHERE crane_id = %(crane_id)s
+    """
+    with conn.cursor() as cur:
+        for entry in crane_statuses:
+            cur.execute(sql, {"crane_id": entry["crane_id"], "status": entry["status"]})
+            updated += cur.rowcount
+    return updated
+
+
 # ── 2. Simulation Runs ────────────────────────────────────────────────────────
 
 

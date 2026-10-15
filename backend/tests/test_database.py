@@ -27,6 +27,8 @@ from backend.app.database import (
     insert_simulation_job,
     insert_simulation_run,
     release_crane_assignment,
+    update_crane_status,
+    batch_sync_crane_statuses,
     update_job_status,
     upsert_crane,
 )
@@ -283,6 +285,49 @@ class TestSimulationSchemaQueries:
         mock_cur.fetchone.return_value = None
         crane_missing = get_crane(mock_conn, "C999")
         assert crane_missing is None
+
+    def test_update_crane_status_success(self) -> None:
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_conn.cursor.return_value.__enter__.return_value = mock_cur
+        mock_cur.rowcount = 1
+
+        updated = update_crane_status(mock_conn, crane_id="C1", status="ASSIGNED")
+        assert updated is True
+        mock_cur.execute.assert_called_once()
+        sql, params = mock_cur.execute.call_args[0]
+        assert "UPDATE cranes" in sql
+        assert params["crane_id"] == "C1"
+        assert params["status"] == "ASSIGNED"
+
+    def test_update_crane_status_not_found(self) -> None:
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_conn.cursor.return_value.__enter__.return_value = mock_cur
+        mock_cur.rowcount = 0
+
+        updated = update_crane_status(mock_conn, crane_id="NON_EXISTENT", status="AVAILABLE")
+        assert updated is False
+
+    def test_batch_sync_crane_statuses_success(self) -> None:
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_conn.cursor.return_value.__enter__.return_value = mock_cur
+        mock_cur.rowcount = 1
+
+        statuses = [
+            {"crane_id": "C1", "status": "ASSIGNED"},
+            {"crane_id": "CRANE_DEMO_01", "status": "ASSIGNED"},
+        ]
+        count = batch_sync_crane_statuses(mock_conn, statuses)
+        assert count == 2
+        assert mock_cur.execute.call_count == 2
+
+    def test_batch_sync_crane_statuses_empty_list(self) -> None:
+        mock_conn = MagicMock()
+        count = batch_sync_crane_statuses(mock_conn, [])
+        assert count == 0
+        mock_conn.cursor.assert_not_called()
 
     # ── Simulation Runs ──
     def test_insert_simulation_run(self) -> None:
