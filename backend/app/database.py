@@ -404,6 +404,39 @@ def update_job_status(
         return cur.rowcount > 0
 
 
+def update_job_work_progress(
+    conn,
+    *,
+    run_id: int,
+    job_id: str,
+    work_completed: int,
+    work_remaining: int,
+) -> bool:
+    """Update the work_completed and work_remaining columns for a simulation job.
+
+    Used when a crane fails mid-job to persist the progress snapshot from the
+    C++ runtime.  Does NOT change the job status — that is handled separately
+    by update_job_status().
+
+    Returns True if a row was updated, False if the (run_id, job_id) was
+    not found.
+    """
+    sql = """
+        UPDATE simulation_jobs
+           SET work_completed = %(work_completed)s,
+               work_remaining = %(work_remaining)s
+         WHERE run_id = %(run_id)s AND job_id = %(job_id)s
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql, {
+            "run_id": run_id,
+            "job_id": job_id,
+            "work_completed": work_completed,
+            "work_remaining": work_remaining,
+        })
+        return cur.rowcount > 0
+
+
 def get_jobs_for_run(conn, run_id: int) -> list[dict[str, Any]]:
     """Fetch all simulation jobs belonging to a run."""
     sql = """
@@ -420,6 +453,24 @@ def get_jobs_for_run(conn, run_id: int) -> list[dict[str, Any]]:
     with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
         cur.execute(sql, {"run_id": run_id})
         return [dict(row) for row in cur.fetchall()]
+
+
+def get_simulation_job_id(
+    conn,
+    *,
+    run_id: int,
+    job_id: str,
+) -> int | None:
+    """Look up the integer primary key simulation_job_id for a job in a run."""
+    sql = """
+        SELECT simulation_job_id
+          FROM simulation_jobs
+         WHERE run_id = %(run_id)s AND job_id = %(job_id)s
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql, {"run_id": run_id, "job_id": job_id})
+        row = cur.fetchone()
+        return row[0] if row else None
 
 
 # ── 4. Crane Assignments ──────────────────────────────────────────────────────
@@ -466,6 +517,50 @@ def release_crane_assignment(
             "release_reason": release_reason,
         })
         return cur.rowcount > 0
+
+
+def release_active_crane_assignment_by_crane(
+    conn,
+    *,
+    crane_id: str,
+    release_reason: str,
+) -> bool:
+    """Release the currently active assignment for a crane, if one exists."""
+    sql = """
+        UPDATE crane_assignments
+           SET released_at    = now(),
+               release_reason = %(release_reason)s
+         WHERE crane_id = %(crane_id)s
+           AND released_at IS NULL
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql, {
+            "crane_id": crane_id,
+            "release_reason": release_reason,
+        })
+        return getattr(cur, "rowcount", 0) > 0
+
+
+def release_active_crane_assignments_by_job(
+    conn,
+    *,
+    simulation_job_id: int,
+    release_reason: str = "JOB_COMPLETED",
+) -> int:
+    """Release all currently active crane assignments for a given simulation_job_id."""
+    sql = """
+        UPDATE crane_assignments
+           SET released_at    = now(),
+               release_reason = %(release_reason)s
+         WHERE simulation_job_id = %(simulation_job_id)s
+           AND released_at IS NULL
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql, {
+            "simulation_job_id": simulation_job_id,
+            "release_reason": release_reason,
+        })
+        return getattr(cur, "rowcount", 0)
 
 
 # ── 5. Disruption Events ──────────────────────────────────────────────────────

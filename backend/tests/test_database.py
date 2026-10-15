@@ -21,15 +21,19 @@ from backend.app.database import (
     get_disruption_events_for_run,
     get_jobs_for_run,
     get_resource_inventory,
+    get_simulation_job_id,
     get_simulation_run,
     insert_crane_assignment,
     insert_disruption_event,
     insert_simulation_job,
     insert_simulation_run,
+    release_active_crane_assignment_by_crane,
+    release_active_crane_assignments_by_job,
     release_crane_assignment,
     update_crane_status,
     batch_sync_crane_statuses,
     update_job_status,
+    update_job_work_progress,
     upsert_crane,
 )
 
@@ -450,6 +454,38 @@ class TestSimulationSchemaQueries:
         assert len(jobs) == 2
         assert jobs[0]["job_id"] == "J1"
 
+    def test_update_job_work_progress(self) -> None:
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_conn.cursor.return_value.__enter__.return_value = mock_cur
+        mock_cur.rowcount = 1
+
+        updated = update_job_work_progress(
+            mock_conn,
+            run_id=42,
+            job_id="J1",
+            work_completed=5,
+            work_remaining=5,
+        )
+        assert updated is True
+        sql, params = mock_cur.execute.call_args[0]
+        assert "UPDATE simulation_jobs" in sql
+        assert params["work_completed"] == 5
+        assert params["work_remaining"] == 5
+
+    def test_get_simulation_job_id(self) -> None:
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_conn.cursor.return_value.__enter__.return_value = mock_cur
+        mock_cur.fetchone.return_value = (105,)
+
+        sim_job_id = get_simulation_job_id(mock_conn, run_id=42, job_id="J1")
+        assert sim_job_id == 105
+        sql, params = mock_cur.execute.call_args[0]
+        assert "SELECT simulation_job_id" in sql
+        assert params["run_id"] == 42
+        assert params["job_id"] == "J1"
+
     # ── Crane Assignments ──
     def test_insert_and_release_crane_assignment(self) -> None:
         mock_conn = MagicMock()
@@ -467,6 +503,36 @@ class TestSimulationSchemaQueries:
         mock_cur.rowcount = 1
         released = release_crane_assignment(mock_conn, assignment_id=7, release_reason="JOB_COMPLETED")
         assert released is True
+
+    def test_release_active_crane_assignment_by_crane(self) -> None:
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_conn.cursor.return_value.__enter__.return_value = mock_cur
+        mock_cur.rowcount = 1
+
+        released = release_active_crane_assignment_by_crane(
+            mock_conn, crane_id="C1", release_reason="CRANE_FAILED"
+        )
+        assert released is True
+        sql, params = mock_cur.execute.call_args[0]
+        assert "UPDATE crane_assignments" in sql
+        assert params["crane_id"] == "C1"
+        assert params["release_reason"] == "CRANE_FAILED"
+
+    def test_release_active_crane_assignments_by_job(self) -> None:
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_conn.cursor.return_value.__enter__.return_value = mock_cur
+        mock_cur.rowcount = 2
+
+        count = release_active_crane_assignments_by_job(
+            mock_conn, simulation_job_id=101, release_reason="JOB_COMPLETED"
+        )
+        assert count == 2
+        sql, params = mock_cur.execute.call_args[0]
+        assert "UPDATE crane_assignments" in sql
+        assert params["simulation_job_id"] == 101
+        assert params["release_reason"] == "JOB_COMPLETED"
 
     # ── Disruption Events ──
     def test_insert_and_get_disruption_event(self) -> None:

@@ -367,6 +367,11 @@ static void cmd_snapshot(const picojson::object& /*req*/) {
             jo["work_remaining"]  = picojson::value(static_cast<double>(rec.work_remaining));
             jo["work_completed"]  = picojson::value(static_cast<double>(rec.work_completed));
             jo["rm_allocated"]    = picojson::value(rec.rm_allocated);
+            jo["required_cranes"] = picojson::value(static_cast<double>(rec.job.cranes));
+            bool fulfilled        = g_dp->crane_count_fulfilled(jid);
+            jo["crane_fulfilled"] = picojson::value(fulfilled);
+            bool can_complete     = (rec.state == JobState::ACTIVE && fulfilled);
+            jo["can_complete"]    = picojson::value(can_complete);
             // active crane IDs
             picojson::array cranes_arr;
             for (const std::string& cid : rec.active_cranes) {

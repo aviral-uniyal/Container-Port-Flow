@@ -148,3 +148,45 @@ export async function fetchInventory() {
     return { ok: false, error: 'API unreachable' }
   }
 }
+
+/**
+ * POST /simulation/cranes/{craneId}/fail — mark a crane as FAILED.
+ */
+export async function failCrane(craneId) {
+  try {
+    const res = await fetch(`/simulation/cranes/${encodeURIComponent(craneId)}/fail`, {
+      method: 'POST',
+    })
+    return handleResponse(res)
+  } catch {
+    return { ok: false, error: 'API unreachable' }
+  }
+}
+
+/**
+ * POST /simulation/cranes/{craneId}/recover — recover a FAILED crane.
+ */
+export async function recoverCrane(craneId) {
+  try {
+    const res = await fetch(`/simulation/cranes/${encodeURIComponent(craneId)}/recover`, {
+      method: 'POST',
+    })
+    return handleResponse(res)
+  } catch {
+    return { ok: false, error: 'API unreachable' }
+  }
+}
+
+/**
+ * POST /simulation/reconcile — reconcile PostgreSQL state with C++ runtime snapshot.
+ */
+export async function reconcileState() {
+  try {
+    const res = await fetch('/simulation/reconcile', {
+      method: 'POST',
+    })
+    return handleResponse(res)
+  } catch {
+    return { ok: false, error: 'API unreachable' }
+  }
+}

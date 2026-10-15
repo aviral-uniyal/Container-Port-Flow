@@ -1028,7 +1028,19 @@ static bool test_multi_crane_lifecycle_trace() {
     ASSERT_TRUE(pd.crane_registry().get_crane("C1").status == CraneStatus::ASSIGNED);
     ASSERT_TRUE(pd.crane_registry().get_crane("C2").status == CraneStatus::FAILED);
 
-    // Step 4: The job completes.
+    // Step 4: Attempting to complete while undersupplied throws (premature completion rejected).
+    ASSERT_THROWS(pd.complete_job("J1"));
+    ASSERT_TRUE(pd.job_state("J1") == JobState::ACTIVE);
+
+    // Step 5: C2 is recovered. It tops up J1 back to its full requirement of 2 cranes.
+    RecoveryResult rr2 = pd.on_crane_recovered("C2");
+    ASSERT_TRUE(rr2.job_dispatched);
+    ASSERT_EQ(rr2.dispatched_job_id, std::string("J1"));
+    ASSERT_TRUE(pd.crane_count_fulfilled("J1"));
+    ASSERT_TRUE(pd.crane_registry().get_crane("C1").status == CraneStatus::ASSIGNED);
+    ASSERT_TRUE(pd.crane_registry().get_crane("C2").status == CraneStatus::ASSIGNED);
+
+    // Step 6: Now that all required cranes are assigned, the job completes cleanly.
     pd.complete_job("J1");
     ASSERT_TRUE(pd.job_state("J1") == JobState::COMPLETED);
     // RM released cleanly once: 0 allocated, full capacities restored.
@@ -1036,9 +1048,9 @@ static bool test_multi_crane_lifecycle_trace() {
     ASSERT_EQ(pd.resource_manager().allocated().cranes, 0);
     ASSERT_EQ(pd.resource_manager().allocated().trucks, 0);
     ASSERT_EQ(pd.resource_manager().available().cranes, 2);
-    // CraneRegistry: C1 released to AVAILABLE; C2 remains FAILED (no phantom recovery).
+    // CraneRegistry: both C1 and C2 released to AVAILABLE.
     ASSERT_TRUE(pd.crane_registry().get_crane("C1").status == CraneStatus::AVAILABLE);
-    ASSERT_TRUE(pd.crane_registry().get_crane("C2").status == CraneStatus::FAILED);
+    ASSERT_TRUE(pd.crane_registry().get_crane("C2").status == CraneStatus::AVAILABLE);
     return true;
 }
 
@@ -1062,6 +1074,87 @@ static bool test_multi_crane_resume_with_multiple_available_cranes() {
     ASSERT_EQ(static_cast<int>(pd.job_record("J1").active_cranes.size()), 2);
     ASSERT_TRUE(pd.job_record("J1").active_cranes.count("C1") > 0);
     ASSERT_TRUE(pd.job_record("J1").active_cranes.count("C3") > 0);
+    return true;
+}
+
+// ─── Test 53: Confirmed live scenario regression test ─────────────────────────
+// 1. JOB_NEW requires 2 cranes (C1, CRANE_DEMO_01).
+// 2. Both assigned -> ACTIVE.
+// 3. C1 fails -> C1 is FAILED, CRANE_DEMO_01 ASSIGNED, JOB_NEW stays ACTIVE.
+// 4. Attempt premature complete -> rejected!
+// 5. C1 recovered -> automatically reassigned to JOB_NEW.
+// 6. Complete job -> succeeds, both cranes released to AVAILABLE.
+static bool test_confirmed_live_scenario_regression() {
+    PortDispatcher pd(2, 2, 2, DispatchPolicy::FCFS);
+    pd.register_crane("C1");
+    pd.register_crane("CRANE_DEMO_01");
+
+    pd.submit_job(make_job("JOB_NEW", 0, 100, 5, 1, 2, 1));
+    ASSERT_TRUE(pd.job_state("JOB_NEW") == JobState::ACTIVE);
+    ASSERT_TRUE(pd.crane_registry().get_crane("C1").status == CraneStatus::ASSIGNED);
+    ASSERT_TRUE(pd.crane_registry().get_crane("CRANE_DEMO_01").status == CraneStatus::ASSIGNED);
+    ASSERT_TRUE(pd.crane_count_fulfilled("JOB_NEW"));
+
+    // C1 fails
+    FailureResult fr = pd.on_crane_failed("C1", 30, 70);
+    ASSERT_FALSE(fr.job_interrupted);
+    ASSERT_TRUE(pd.job_state("JOB_NEW") == JobState::ACTIVE);
+    ASSERT_FALSE(pd.crane_count_fulfilled("JOB_NEW"));
+    ASSERT_TRUE(pd.crane_registry().get_crane("C1").status == CraneStatus::FAILED);
+    ASSERT_TRUE(pd.crane_registry().get_crane("CRANE_DEMO_01").status == CraneStatus::ASSIGNED);
+
+    // Premature completion attempt is rejected
+    ASSERT_THROWS(pd.complete_job("JOB_NEW"));
+    ASSERT_TRUE(pd.job_state("JOB_NEW") == JobState::ACTIVE);
+
+    // C1 is recovered -> reassigned to JOB_NEW
+    RecoveryResult rr = pd.on_crane_recovered("C1");
+    ASSERT_TRUE(rr.job_dispatched);
+    ASSERT_EQ(rr.dispatched_job_id, std::string("JOB_NEW"));
+    ASSERT_TRUE(pd.crane_count_fulfilled("JOB_NEW"));
+    ASSERT_TRUE(pd.crane_registry().get_crane("C1").status == CraneStatus::ASSIGNED);
+    ASSERT_TRUE(pd.crane_registry().get_crane("CRANE_DEMO_01").status == CraneStatus::ASSIGNED);
+
+    // Job completes cleanly
+    pd.complete_job("JOB_NEW");
+    ASSERT_TRUE(pd.job_state("JOB_NEW") == JobState::COMPLETED);
+    ASSERT_EQ(pd.resource_manager().allocated().cranes, 0);
+    ASSERT_EQ(pd.resource_manager().available().cranes, 2);
+    ASSERT_TRUE(pd.crane_registry().get_crane("C1").status == CraneStatus::AVAILABLE);
+    ASSERT_TRUE(pd.crane_registry().get_crane("CRANE_DEMO_01").status == CraneStatus::AVAILABLE);
+    ASSERT_EQ(pd.job_record("JOB_NEW").work_completed, 100);
+    ASSERT_EQ(pd.job_record("JOB_NEW").work_remaining, 0);
+
+    return true;
+}
+
+// ─── Test 54: Validation and work-accounting safeguards ───────────────────────
+static bool test_complete_validation_and_accounting_safeguards() {
+    PortDispatcher pd(2, 2, 2, DispatchPolicy::FCFS);
+    pd.register_crane("C1");
+    pd.register_crane("C2");
+
+    pd.submit_job(make_job("J1", 0, 100, 5, 1, 1, 1));
+    pd.complete_job("J1");
+    ASSERT_TRUE(pd.job_state("J1") == JobState::COMPLETED);
+
+    // Duplicate complete on COMPLETED throws
+    ASSERT_THROWS(pd.complete_job("J1"));
+
+    // Complete on unknown / empty throws
+    ASSERT_THROWS(pd.complete_job("NONEXISTENT"));
+    ASSERT_THROWS(pd.complete_job(""));
+
+    // Work accounting: completed + remaining == total
+    pd.submit_job(make_job("J2", 0, 150, 5, 1, 1, 1));
+    pd.on_crane_failed("C1", 60, 90);
+    const auto& rec = pd.job_record("J2");
+    ASSERT_EQ(rec.work_completed + rec.work_remaining, rec.job.work_total);
+
+    // Complete on INTERRUPTED throws
+    ASSERT_TRUE(rec.state == JobState::INTERRUPTED);
+    ASSERT_THROWS(pd.complete_job("J2"));
+
     return true;
 }
 
@@ -1141,6 +1234,8 @@ int main() {
     run_test("No phantom RM cranes after multi-cycle fail/recover/complete", test_no_phantom_rm_cranes_after_cycles);
     run_test("Multi-crane full lifecycle trace (4-step user scenario)", test_multi_crane_lifecycle_trace);
     run_test("Multi-crane resume with multiple available cranes", test_multi_crane_resume_with_multiple_available_cranes);
+    run_test("Confirmed live scenario regression (undersupplied completion rejected, recovered topped up)", test_confirmed_live_scenario_regression);
+    run_test("Complete validation and work-accounting safeguards", test_complete_validation_and_accounting_safeguards);
 
     std::cout << "\n─── Summary ────────────────────────\n";
     std::cout << "  Total:  " << g_total  << "\n";

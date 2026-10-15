@@ -22,10 +22,16 @@ from .database import (
     check_connection,
     get_connection,
     get_resource_inventory,
+    get_simulation_job_id,
+    insert_crane_assignment,
+    insert_disruption_event,
     insert_simulation_job,
     insert_simulation_run,
+    release_active_crane_assignment_by_crane,
+    release_active_crane_assignments_by_job,
     update_crane_status,
     update_job_status,
+    update_job_work_progress,
     upsert_crane,
 )
 from .models import (
@@ -391,6 +397,15 @@ def simulation_complete_job(job_id: str, request: Request):
                         job_id=job_id,
                         status="COMPLETED",
                     )
+                    sim_job_id = get_simulation_job_id(
+                        conn, run_id=run_id, job_id=job_id
+                    )
+                    if sim_job_id is not None:
+                        release_active_crane_assignments_by_job(
+                            conn,
+                            simulation_job_id=sim_job_id,
+                            release_reason="JOB_COMPLETED",
+                        )
                 logger.info("Persisted completion for job %s run %d", job_id, run_id)
             except Exception as exc:
                 logger.warning(
@@ -414,6 +429,359 @@ def simulation_snapshot(request: Request):
     """Return the full C++ simulation state snapshot."""
     bridge = _get_bridge(request)
     return _send(bridge, {"cmd": "snapshot"})
+
+
+@router.post("/simulation/cranes/{crane_id}/fail")
+def simulation_crane_fail(crane_id: str, request: Request):
+    """Mark a crane as FAILED in the C++ runtime and persist to PostgreSQL.
+
+    Handles both idle (AVAILABLE) and assigned (ASSIGNED) cranes:
+      - For idle cranes, sends ``idle_crane_failed`` to C++.
+      - For assigned cranes, sends ``crane_failed`` with work progress.
+
+    The endpoint inspects the current crane status via a snapshot before
+    deciding which C++ command to use.  This avoids requiring the frontend
+    to know implementation details about idle vs. assigned failures.
+    """
+    bridge = _get_bridge(request)
+    crane_id = crane_id.strip()
+    if not crane_id:
+        raise HTTPException(status_code=400, detail="crane_id must not be empty")
+
+    # 1. Take a snapshot to determine current crane state.
+    try:
+        snap = bridge.send({"cmd": "snapshot"})
+    except CppBridgeError:
+        raise HTTPException(
+            status_code=503,
+            detail="C++ simulation bridge is unavailable",
+        )
+    if not snap.get("ok", False):
+        raise HTTPException(
+            status_code=400,
+            detail=snap.get("error", "snapshot failed"),
+        )
+
+    # Find the crane in the snapshot.
+    crane_info = None
+    for c in snap.get("cranes", []):
+        if c.get("crane_id") == crane_id:
+            crane_info = c
+            break
+
+    if crane_info is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Crane '{crane_id}' not found in C++ runtime",
+        )
+
+    current_status = crane_info.get("status", "")
+    if current_status == "FAILED":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Crane '{crane_id}' is already FAILED",
+        )
+
+    # 2. Determine the correct C++ command based on current status.
+    affected_job_id = ""
+    work_completed = 0
+    work_remaining = 0
+    job_interrupted = False
+
+    if current_status == "ASSIGNED":
+        # Find the job assigned to this crane from the snapshot.
+        assigned_job = crane_info.get("assigned_job", "")
+        # Find job record in snapshot to get work progress.
+        job_info = None
+        for j in snap.get("jobs", []):
+            if j.get("job_id") == assigned_job:
+                job_info = j
+                break
+
+        wc = job_info.get("work_completed", 0) if job_info else 0
+        wr = job_info.get("work_remaining", 1) if job_info else 1
+        # work_remaining must be > 0 for C++
+        if wr <= 0:
+            wr = 1
+
+        cmd: dict[str, Any] = {
+            "cmd": "crane_failed",
+            "crane_id": crane_id,
+            "work_completed": wc,
+            "work_remaining": wr,
+        }
+        resp = _send(bridge, cmd)
+        affected_job_id = resp.get("affected_job_id", assigned_job)
+        job_interrupted = resp.get("job_interrupted", False)
+        work_completed = wc
+        work_remaining = wr
+    else:
+        # AVAILABLE crane
+        cmd = {
+            "cmd": "idle_crane_failed",
+            "crane_id": crane_id,
+        }
+        resp = _send(bridge, cmd)
+
+    # 3. Persist to PostgreSQL.
+    pool = _get_db_pool(request)
+    run_id = getattr(request.app.state, "current_run_id", None)
+
+    if pool is not None:
+        try:
+            with get_connection(pool) as conn:
+                # Update crane status.
+                updated = update_crane_status(
+                    conn, crane_id=crane_id, status="FAILED"
+                )
+                if not updated:
+                    logger.warning(
+                        "Crane %s not found in DB during fail persist", crane_id
+                    )
+
+                # Look up simulation_job_id if an active job was affected.
+                sim_job_id = None
+                if affected_job_id and run_id is not None:
+                    sim_job_id = get_simulation_job_id(
+                        conn, run_id=run_id, job_id=affected_job_id
+                    )
+
+                # Record disruption event.
+                if run_id is not None:
+                    insert_disruption_event(
+                        conn,
+                        run_id=run_id,
+                        crane_id=crane_id,
+                        event_type="CRANE_FAILED",
+                        simulation_job_id=sim_job_id,
+                        work_completed=work_completed if affected_job_id else None,
+                        work_remaining=work_remaining if affected_job_id else None,
+                    )
+
+                # Release any active assignment record for this crane.
+                release_active_crane_assignment_by_crane(
+                    conn, crane_id=crane_id, release_reason="CRANE_FAILED"
+                )
+
+                # Update job status and work progress if interrupted.
+                if affected_job_id and job_interrupted and run_id is not None:
+                    update_job_status(
+                        conn,
+                        run_id=run_id,
+                        job_id=affected_job_id,
+                        status="INTERRUPTED",
+                    )
+                    update_job_work_progress(
+                        conn,
+                        run_id=run_id,
+                        job_id=affected_job_id,
+                        work_completed=work_completed,
+                        work_remaining=work_remaining,
+                    )
+
+            logger.info(
+                "Persisted crane %s failure (affected_job=%s, interrupted=%s)",
+                crane_id, affected_job_id, job_interrupted,
+            )
+        except Exception as exc:
+            logger.error("DB write failed for crane %s failure: %s", crane_id, exc)
+            # Attempt safe compensating rollback for idle crane failure if no job was affected.
+            if not affected_job_id:
+                try:
+                    comp_resp = bridge.send({"cmd": "crane_recovered", "crane_id": crane_id})
+                    if comp_resp.get("ok", False) and not comp_resp.get("job_dispatched", False):
+                        # Verify rollback in runtime snapshot.
+                        v_snap = bridge.send({"cmd": "snapshot"})
+                        for c in v_snap.get("cranes", []):
+                            if c.get("crane_id") == crane_id and c.get("status") == "AVAILABLE":
+                                raise HTTPException(
+                                    status_code=500,
+                                    detail=f"Database persistence failed ({exc}). Runtime mutation was rolled back to AVAILABLE.",
+                                )
+                except HTTPException:
+                    raise
+                except Exception as comp_exc:
+                    logger.warning("Compensating rollback failed: %s", comp_exc)
+
+            raise HTTPException(
+                status_code=500,
+                detail=f"Database persistence failed ({exc}). Runtime crane '{crane_id}' is FAILED. Reconciliation required.",
+            )
+    else:
+        logger.warning(
+            "No database pool; skipping crane failure persistence for %s",
+            crane_id,
+        )
+
+    # 4. Sync all crane statuses from C++ snapshot.
+    _sync_crane_statuses(bridge, request)
+
+    result: dict[str, Any] = {
+        "ok": True,
+        "crane_id": crane_id,
+        "status": "FAILED",
+        "affected_job_id": affected_job_id,
+        "job_interrupted": job_interrupted,
+    }
+    if affected_job_id:
+        result["work_completed"] = work_completed
+        result["work_remaining"] = work_remaining
+    return result
+
+
+@router.post("/simulation/cranes/{crane_id}/recover")
+def simulation_crane_recover(crane_id: str, request: Request):
+    """Recover a FAILED crane back to AVAILABLE.
+
+    Sends ``crane_recovered`` to the C++ runtime, persists the status change
+    to PostgreSQL, and records a CRANE_RECOVERED disruption event.
+    """
+    bridge = _get_bridge(request)
+    crane_id = crane_id.strip()
+    if not crane_id:
+        raise HTTPException(status_code=400, detail="crane_id must not be empty")
+
+    # Send recover command to C++.
+    cmd: dict[str, Any] = {
+        "cmd": "crane_recovered",
+        "crane_id": crane_id,
+    }
+    resp = _send(bridge, cmd)
+
+    dispatched_job_id = resp.get("dispatched_job_id", "")
+    job_dispatched = resp.get("job_dispatched", False)
+
+    # Persist to PostgreSQL.
+    pool = _get_db_pool(request)
+    run_id = getattr(request.app.state, "current_run_id", None)
+
+    if pool is not None:
+        try:
+            with get_connection(pool) as conn:
+                updated = update_crane_status(
+                    conn, crane_id=crane_id, status="AVAILABLE"
+                )
+                if not updated:
+                    logger.warning(
+                        "Crane %s not found in DB during recover persist",
+                        crane_id,
+                    )
+
+                if run_id is not None:
+                    insert_disruption_event(
+                        conn,
+                        run_id=run_id,
+                        crane_id=crane_id,
+                        event_type="CRANE_RECOVERED",
+                    )
+                    if dispatched_job_id:
+                        sim_job_id = get_simulation_job_id(
+                            conn, run_id=run_id, job_id=dispatched_job_id
+                        )
+                        if sim_job_id is not None:
+                            insert_crane_assignment(
+                                conn,
+                                crane_id=crane_id,
+                                simulation_job_id=sim_job_id,
+                            )
+                        update_job_status(
+                            conn,
+                            run_id=run_id,
+                            job_id=dispatched_job_id,
+                            status="ACTIVE",
+                        )
+
+            logger.info("Persisted crane %s recovery", crane_id)
+        except Exception as exc:
+            logger.error("DB write failed for crane %s recovery: %s", crane_id, exc)
+            raise HTTPException(
+                status_code=500,
+                detail=f"Database persistence failed ({exc}). Runtime crane '{crane_id}' is AVAILABLE. Reconciliation required.",
+            )
+    else:
+        logger.warning(
+            "No database pool; skipping crane recovery persistence for %s",
+            crane_id,
+        )
+
+    # Sync all crane statuses.
+    _sync_crane_statuses(bridge, request)
+
+    result: dict[str, Any] = {
+        "ok": True,
+        "crane_id": crane_id,
+        "status": "AVAILABLE",
+        "dispatched_job_id": dispatched_job_id,
+        "job_dispatched": job_dispatched,
+    }
+    return result
+
+
+@router.post("/simulation/reconcile")
+def simulation_reconcile(request: Request):
+    """Reconcile PostgreSQL state with the authoritative C++ runtime snapshot.
+
+    Compares runtime crane statuses and active/interrupted jobs with PostgreSQL,
+    repairing any discrepancies caused by transient database write failures
+    without duplicating events or resource releases.
+    """
+    bridge = _get_bridge(request)
+    pool = _get_db_pool(request)
+    if pool is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    try:
+        snap = bridge.send({"cmd": "snapshot"})
+    except CppBridgeError:
+        raise HTTPException(
+            status_code=503,
+            detail="C++ simulation bridge is unavailable",
+        )
+    if not snap.get("ok", False):
+        raise HTTPException(
+            status_code=400,
+            detail=snap.get("error", "snapshot failed"),
+        )
+
+    run_id = getattr(request.app.state, "current_run_id", None)
+    cranes_list = snap.get("cranes", [])
+    jobs_list = snap.get("jobs", [])
+
+    crane_statuses = []
+    for c in cranes_list:
+        cid = c.get("crane_id", "")
+        status = c.get("status", "")
+        if cid and status in ("AVAILABLE", "ASSIGNED", "FAILED"):
+            crane_statuses.append({"crane_id": cid, "status": status})
+
+    reconciled_cranes = 0
+    reconciled_jobs = 0
+    with get_connection(pool) as conn:
+        if crane_statuses:
+            reconciled_cranes = batch_sync_crane_statuses(conn, crane_statuses)
+
+        if run_id is not None:
+            for j in jobs_list:
+                jid = j.get("job_id", "")
+                jstate = j.get("state", "")
+                wc = int(j.get("work_completed", 0))
+                wr = int(j.get("work_remaining", 0))
+                if jstate in ("INTERRUPTED", "ACTIVE", "COMPLETED", "CANCELLED"):
+                    update_job_status(conn, run_id=run_id, job_id=jid, status=jstate)
+                    update_job_work_progress(
+                        conn,
+                        run_id=run_id,
+                        job_id=jid,
+                        work_completed=wc,
+                        work_remaining=wr,
+                    )
+                    reconciled_jobs += 1
+
+    return {
+        "ok": True,
+        "reconciled_cranes": reconciled_cranes,
+        "reconciled_jobs": reconciled_jobs,
+    }
 
 
 @router.get("/inventory")

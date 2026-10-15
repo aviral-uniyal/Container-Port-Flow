@@ -1,15 +1,28 @@
 import { useState } from 'react'
 
 /**
- * CraneRegistry — shows registered cranes with their status and assigned job.
- * Includes an inline registration form when `onRegister` is provided.
+ * CraneRegistry — shows registered cranes with their status, assigned job,
+ * and action buttons for failure/recovery.
  *
  * Props:
- *   cranes     — array of crane objects: { crane_id, status, assigned_job_id? }
- *   onRegister — callback(crane_id) to register a new crane
- *   disabled   — boolean, disables the register button while a request is running
+ *   cranes         — array of crane objects: { crane_id, status, assigned_job_id? }
+ *   onRegister     — callback(crane_id) to register a new crane
+ *   onFail         — callback(crane_id) to mark a crane as failed
+ *   onRecover      — callback(crane_id) to recover a failed crane
+ *   disabled       — boolean, disables the register button while a request is running
+ *   loading        — object tracking in-flight requests per action key
+ *   lastFailResult — { crane_id, affected_job_id, job_interrupted, ... } | null
  */
-export default function CraneRegistry({ cranes = [], onRegister, disabled }) {
+export default function CraneRegistry({
+  cranes = [],
+  onRegister,
+  onFail,
+  onRecover,
+  onReconcile,
+  disabled,
+  loading = {},
+  lastFailResult,
+}) {
   const [craneId, setCraneId] = useState('')
 
   const STATUS_BADGE = {
@@ -63,6 +76,42 @@ export default function CraneRegistry({ cranes = [], onRegister, disabled }) {
         </div>
       )}
 
+      {/* ── Disruption result banner ── */}
+      {lastFailResult && lastFailResult.job_interrupted && (
+        <div
+          className="card__body"
+          style={{
+            borderBottom: '1px solid var(--clr-border)',
+            padding: 'var(--space-3) var(--space-5)',
+            background: 'var(--clr-badge-failed)',
+            fontSize: 'var(--text-sm)',
+            color: 'var(--clr-badge-failed-t)',
+          }}
+        >
+          ⚠️ Crane <strong>{lastFailResult.crane_id}</strong> failure interrupted
+          job <strong>{lastFailResult.affected_job_id}</strong>.
+          {lastFailResult.work_remaining != null && (
+            <> Work remaining: {lastFailResult.work_remaining} units.</>
+          )}
+          {lastFailResult.db_sync_warning && (
+            <div style={{ marginTop: 'var(--space-1)', color: 'var(--clr-err)' }}>
+              ⚠ {lastFailResult.db_sync_warning}
+              {onReconcile && (
+                <button
+                  id="btn-crane-reconcile-sync"
+                  className="btn btn--outline btn--sm"
+                  style={{ marginLeft: 'var(--space-3)' }}
+                  onClick={onReconcile}
+                  disabled={loading.reconcile}
+                >
+                  {loading.reconcile ? 'Syncing…' : '⚖ Reconcile Now'}
+                </button>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+
       {/* ── Crane table ── */}
       <div className="table-wrapper">
         <table className="table" aria-label="Crane registry list">
@@ -71,12 +120,13 @@ export default function CraneRegistry({ cranes = [], onRegister, disabled }) {
               <th scope="col">Crane ID</th>
               <th scope="col">Status</th>
               <th scope="col">Assigned Job</th>
+              <th scope="col">Actions</th>
             </tr>
           </thead>
           <tbody>
             {cranes.length === 0 ? (
               <tr>
-                <td colSpan={3}>
+                <td colSpan={4}>
                   <div className="empty-state">
                     <div className="empty-state__icon">🏗️</div>
                     No cranes registered yet.
@@ -84,23 +134,71 @@ export default function CraneRegistry({ cranes = [], onRegister, disabled }) {
                 </td>
               </tr>
             ) : (
-              cranes.map(crane => (
-                <tr key={crane.crane_id}>
-                  <td>
-                    <code style={{ fontFamily: 'monospace', fontSize: '0.8125rem' }}>
-                      {crane.crane_id}
-                    </code>
-                  </td>
-                  <td>
-                    <span className={STATUS_BADGE[crane.status] ?? 'badge'}>
-                      {crane.status}
-                    </span>
-                  </td>
-                  <td style={{ color: crane.assigned_job_id ? 'inherit' : 'var(--clr-text-muted)' }}>
-                    {crane.assigned_job_id ?? 'None'}
-                  </td>
-                </tr>
-              ))
+              cranes.map(crane => {
+                const failKey = `fail-${crane.crane_id}`
+                const recoverKey = `recover-${crane.crane_id}`
+                const isFailing = loading[failKey]
+                const isRecovering = loading[recoverKey]
+                const isBusy = isFailing || isRecovering
+
+                return (
+                  <tr key={crane.crane_id}>
+                    <td>
+                      <code style={{ fontFamily: 'monospace', fontSize: '0.8125rem' }}>
+                        {crane.crane_id}
+                      </code>
+                    </td>
+                    <td>
+                      <span className={STATUS_BADGE[crane.status] ?? 'badge'}>
+                        {crane.status}
+                      </span>
+                    </td>
+                    <td style={{ color: crane.assigned_job_id ? 'inherit' : 'var(--clr-text-muted)' }}>
+                      {crane.assigned_job_id ?? 'None'}
+                    </td>
+                    <td>
+                      {crane.status === 'AVAILABLE' && onFail && (
+                        <button
+                          id={`btn-fail-${crane.crane_id}`}
+                          className="btn btn--danger btn--sm"
+                          onClick={() => onFail(crane.crane_id)}
+                          disabled={isBusy}
+                        >
+                          {isFailing ? 'Failing…' : '⚠ Mark as Failed'}
+                        </button>
+                      )}
+                      {crane.status === 'ASSIGNED' && onFail && (
+                        <button
+                          id={`btn-fail-${crane.crane_id}`}
+                          className="btn btn--danger btn--sm"
+                          onClick={() => {
+                            if (window.confirm(
+                              `Crane "${crane.crane_id}" is assigned to job "${crane.assigned_job_id}". ` +
+                              'Failing it may interrupt the active job. Continue?'
+                            )) {
+                              onFail(crane.crane_id)
+                            }
+                          }}
+                          disabled={isBusy}
+                          title={`Warning: assigned to job ${crane.assigned_job_id}`}
+                        >
+                          {isFailing ? 'Failing…' : '⚠ Mark as Failed'}
+                        </button>
+                      )}
+                      {crane.status === 'FAILED' && onRecover && (
+                        <button
+                          id={`btn-recover-${crane.crane_id}`}
+                          className="btn btn--success btn--sm"
+                          onClick={() => onRecover(crane.crane_id)}
+                          disabled={isBusy}
+                        >
+                          {isRecovering ? 'Recovering…' : '✓ Recover Crane'}
+                        </button>
+                      )}
+                    </td>
+                  </tr>
+                )
+              })
             )}
           </tbody>
         </table>

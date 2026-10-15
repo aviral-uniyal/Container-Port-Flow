@@ -59,16 +59,36 @@ export default function JobsTable({ jobs = [], onComplete, loading = {} }) {
                   <td>{job.work_remaining ?? '—'}</td>
                   <td>{job.priority ?? '—'}</td>
                   <td>
-                    {job.state === 'ACTIVE' && (
-                      <button
-                        id={`btn-complete-job-${job.job_id}`}
-                        className="btn btn--outline btn--sm"
-                        onClick={() => onComplete?.(job.job_id)}
-                        disabled={loading[`complete-${job.job_id}`]}
-                      >
-                        {loading[`complete-${job.job_id}`] ? 'Completing…' : 'Complete'}
-                      </button>
-                    )}
+                    {job.state === 'ACTIVE' && (() => {
+                      const isEligible = job.can_complete !== undefined
+                        ? job.can_complete
+                        : (!job.required_cranes || !job.active_cranes || job.active_cranes.length >= job.required_cranes)
+                      const isUndersupplied = job.can_complete === false ||
+                        (job.required_cranes && job.active_cranes && job.active_cranes.length < job.required_cranes)
+
+                      return (
+                        <div style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem' }}>
+                          <button
+                            id={`btn-complete-job-${job.job_id}`}
+                            className="btn btn--outline btn--sm"
+                            onClick={() => onComplete?.(job.job_id)}
+                            disabled={loading[`complete-${job.job_id}`] || !isEligible}
+                            title={!isEligible ? 'Cannot complete: missing required crane(s). Recover cranes before completing.' : 'Mark job completed'}
+                          >
+                            {loading[`complete-${job.job_id}`] ? 'Completing…' : 'Complete'}
+                          </button>
+                          {isUndersupplied && (
+                            <span
+                              className="badge"
+                              style={{ background: '#fef3c7', color: '#92400e', fontSize: '0.6875rem' }}
+                              title="Job is missing one or more required cranes"
+                            >
+                              undersupplied
+                            </span>
+                          )}
+                        </div>
+                      )
+                    })()}
                   </td>
                 </tr>
               ))

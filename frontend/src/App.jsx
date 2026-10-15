@@ -14,6 +14,9 @@ import {
   completeJob,
   fetchSnapshot,
   registerCrane,
+  failCrane,
+  recoverCrane,
+  reconcileState,
 } from './api'
 
 /**
@@ -39,6 +42,7 @@ export default function App() {
   const [inventory,        setInventory]        = useState(null)
   const [inventoryLoading, setInventoryLoading] = useState(false)
   const [inventoryError,   setInventoryError]   = useState(null)
+  const [lastFailResult,   setLastFailResult]   = useState(null)
 
   /* ── Helper: set loading flag for a given action key ── */
   function setBusy(key, busy) {
@@ -137,6 +141,7 @@ export default function App() {
       message: `Simulation initialized — policy: ${result.data.policy || 'FCFS'}.`,
       severity: 'ok',
     })
+    setLastFailResult(null)
     await refreshSnapshot()
     await refreshInventory()
   }
@@ -193,6 +198,76 @@ export default function App() {
     await refreshInventory()
   }
 
+  /* ── Fail crane ── */
+  async function handleCraneFail(craneId) {
+    setBusy(`fail-${craneId}`, true)
+    const result = await failCrane(craneId)
+    setBusy(`fail-${craneId}`, false)
+    if (!result.ok) {
+      setFeedback({ message: `Failed to mark crane "${craneId}" as failed: ${result.error}`, severity: 'err' })
+      return
+    }
+    const data = result.data
+    setLastFailResult(data)
+    let msg = `Crane "${craneId}" marked as FAILED.`
+    if (data.affected_job_id) {
+      msg += ` Job "${data.affected_job_id}" was affected.`
+      if (data.job_interrupted) {
+        msg += ' Job has been interrupted and re-queued.'
+      }
+    }
+    if (data.db_sync_warning) {
+      msg += ` ⚠ DB sync issue: ${data.db_sync_warning}`
+      setFeedback({ message: msg, severity: 'warn' })
+    } else {
+      setFeedback({ message: msg, severity: 'ok' })
+    }
+    await refreshSnapshot()
+    await refreshInventory()
+  }
+
+  /* ── Recover crane ── */
+  async function handleCraneRecover(craneId) {
+    setBusy(`recover-${craneId}`, true)
+    const result = await recoverCrane(craneId)
+    setBusy(`recover-${craneId}`, false)
+    if (!result.ok) {
+      setFeedback({ message: `Failed to recover crane "${craneId}": ${result.error}`, severity: 'err' })
+      return
+    }
+    const data = result.data
+    setLastFailResult(null)
+    let msg = `Crane "${craneId}" recovered to AVAILABLE.`
+    if (data.dispatched_job_id) {
+      msg += ` Job "${data.dispatched_job_id}" was dispatched.`
+    }
+    if (data.db_sync_warning) {
+      msg += ` ⚠ DB sync issue: ${data.db_sync_warning}`
+      setFeedback({ message: msg, severity: 'warn' })
+    } else {
+      setFeedback({ message: msg, severity: 'ok' })
+    }
+    await refreshSnapshot()
+    await refreshInventory()
+  }
+
+  /* ── Reconcile state between C++ snapshot and PostgreSQL ── */
+  async function handleReconcile() {
+    setBusy('reconcile', true)
+    const result = await reconcileState()
+    setBusy('reconcile', false)
+    if (!result.ok) {
+      setFeedback({ message: `Reconciliation failed: ${result.error}`, severity: 'err' })
+    } else {
+      setFeedback({
+        message: `Reconciliation complete: ${result.data.reconciled_cranes} cranes, ${result.data.reconciled_jobs} jobs synced.`,
+        severity: 'ok',
+      })
+    }
+    await refreshSnapshot()
+    await refreshInventory()
+  }
+
   /* ── Manual snapshot refresh ── */
   async function handleRefresh() {
     setBusy('refresh', true)
@@ -213,15 +288,25 @@ export default function App() {
       <header className="app-header" role="banner">
         <h1 className="app-header__logo">Container-Port-Flow</h1>
         <span className="app-header__subtitle">Port Operations Dashboard</span>
-        <button
-          id="btn-refresh-snapshot"
-          className="btn btn--outline btn--sm"
-          style={{ marginLeft: 'auto' }}
-          onClick={handleRefresh}
-          disabled={loading.refresh}
-        >
-          {loading.refresh ? 'Refreshing…' : '↻ Refresh'}
-        </button>
+        <div style={{ marginLeft: 'auto', display: 'flex', gap: 'var(--space-2)' }}>
+          <button
+            id="btn-reconcile-state"
+            className="btn btn--outline btn--sm"
+            onClick={handleReconcile}
+            disabled={loading.reconcile}
+            title="Synchronize database records with authoritative runtime snapshot"
+          >
+            {loading.reconcile ? 'Syncing…' : '⚖ Reconcile'}
+          </button>
+          <button
+            id="btn-refresh-snapshot"
+            className="btn btn--outline btn--sm"
+            onClick={handleRefresh}
+            disabled={loading.refresh}
+          >
+            {loading.refresh ? 'Refreshing…' : '↻ Refresh'}
+          </button>
+        </div>
       </header>
 
       {/* ── Main ────────────────────────────────────────────── */}
@@ -251,7 +336,12 @@ export default function App() {
         <CraneRegistry
           cranes={cranes}
           onRegister={handleCraneRegister}
+          onFail={handleCraneFail}
+          onRecover={handleCraneRecover}
+          onReconcile={handleReconcile}
           disabled={loading.crane}
+          loading={loading}
+          lastFailResult={lastFailResult}
         />
 
         {/* Database Inventory — PostgreSQL physical resources */}

@@ -281,6 +281,28 @@ body {
   background: var(--clr-accent-light);
 }
 
+.btn--danger {
+  background: var(--clr-badge-failed);
+  color: var(--clr-badge-failed-t);
+  border-color: #f5c6c6;
+}
+
+.btn--danger:hover {
+  background: #fbd5d5;
+  border-color: #f0a8a8;
+}
+
+.btn--success {
+  background: var(--clr-badge-completed);
+  color: var(--clr-badge-completed-t);
+  border-color: #bbf0d0;
+}
+
+.btn--success:hover {
+  background: #c3ebd5;
+  border-color: #9fe2bd;
+}
+
 .btn--sm {
   padding: var(--space-1) var(--space-3);
   font-size: var(--text-xs);

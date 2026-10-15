@@ -45,6 +45,10 @@ struct PortJob {
 //
 //   PENDING     – queued, waiting for resources / crane assignment
 //   ACTIVE      – resources allocated; at least one crane currently assigned
+//                 Note: an ACTIVE job may be "undersupplied" — it has fewer
+//                 active_cranes than job.cranes requires — if one crane failed
+//                 while at least one other remains.  Such a job cannot be
+//                 completed until the missing cranes are reassigned.
 //   INTERRUPTED – last assigned crane failed; no working crane remains;
 //                 RM allocation retained; re-queued for crane reassignment
 //   COMPLETED   – all work done; RM resources released
@@ -214,9 +218,20 @@ public:
     // Mark an ACTIVE job complete.
     // Releases RM allocation and releases all assigned cranes to AVAILABLE.
     //
+    // Completion is only permitted when the job has ALL required cranes
+    // currently ASSIGNED (active_cranes.size() == job.cranes).  If any
+    // required crane is missing (crane failed but the job was not yet
+    // interrupted because other cranes remained), the call is rejected.
+    //
     // Throws std::invalid_argument on:
     //   • empty job_id / unknown job_id / job not ACTIVE
+    //   • job is ACTIVE but has fewer active cranes than job.cranes requires
     void complete_job(const std::string& job_id);
+
+    // Returns true iff a job has all of its required cranes currently ASSIGNED
+    // (i.e., active_cranes.size() == job.cranes).  A job may be ACTIVE but
+    // still be undersupplied if a crane failed while other cranes remained.
+    bool crane_count_fulfilled(const std::string& job_id) const;
 
     // Cancel a job (PENDING, ACTIVE, or INTERRUPTED -> CANCELLED).
     // Releases RM allocation (if any) and releases all assigned cranes.
@@ -268,8 +283,9 @@ private:
 
     void validate_port_job(const PortJob& job) const;
 
-    // Try to dispatch an INTERRUPTED job: assign one available crane and
-    // transition it back to ACTIVE.  Returns dispatched job_id or "".
+    // Try to dispatch an INTERRUPTED job: assign available cranes (at least 1,
+    // up to the job's required count) and transition it back to ACTIVE.
+    // Returns dispatched job_id or "".
     std::string try_dispatch_interrupted();
 
     // Try to dispatch a PENDING job: allocate RM resources + assign cranes.
@@ -279,6 +295,14 @@ private:
     // Main dispatch pump: tries interrupted first (to avoid starvation),
     // then pending.  Returns dispatched job_id or "".
     std::string try_dispatch();
+
+    // Top-up step: for every ACTIVE job that is undersupplied (has fewer
+    // active_cranes than job.cranes), assign as many available cranes as
+    // possible up to the required count.  Called after crane recovery so
+    // that a job which stayed ACTIVE (because other cranes remained) can
+    // reclaim its lost cranes without going through INTERRUPTED.
+    // Returns the job_id of the first job topped up, or "" if none.
+    std::string try_fill_undersupplied_active();
 
     // Sort the pending queue according to the active policy.
     void sort_queue();

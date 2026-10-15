@@ -327,9 +327,15 @@ private:
                     case JobState::CANCELLED:   st="CANCELLED"; break;
                 }
                 jo["state"]          = picojson::value(st);
+                jo["work_total"]     = picojson::value((double)rec.job.work_total);
                 jo["work_remaining"] = picojson::value((double)rec.work_remaining);
                 jo["work_completed"] = picojson::value((double)rec.work_completed);
                 jo["rm_allocated"]   = picojson::value(rec.rm_allocated);
+                jo["required_cranes"] = picojson::value((double)rec.job.cranes);
+                bool fulfilled        = dp->crane_count_fulfilled(jid);
+                jo["crane_fulfilled"] = picojson::value(fulfilled);
+                bool can_complete     = (rec.state == JobState::ACTIVE && fulfilled);
+                jo["can_complete"]    = picojson::value(can_complete);
                 picojson::array ca;
                 for (auto& cid : rec.active_cranes) ca.push_back(picojson::value(cid));
                 jo["active_cranes"] = picojson::value(ca);
@@ -860,6 +866,58 @@ static bool t_manual_testing_scenario() {
     return true;
 }
 
+// T30: Multi-crane premature completion rejected; crane recovery tops up; then completes
+static bool t_multicrane_premature_complete_rejected() {
+    AdapterSim sim;
+    sim.dispatch(R"({"cmd":"init","berths":2,"cranes":2,"trucks":2})");
+    sim.dispatch(R"({"cmd":"register_crane","crane_id":"C1"})");
+    sim.dispatch(R"({"cmd":"register_crane","crane_id":"C2"})");
+
+    auto sub = sim.dispatch(R"({"cmd":"submit_job","job_id":"JOB_NEW","arrival_time":0,"work_total":100,"priority":1,"berths":1,"cranes":2,"trucks":1})");
+    CHECK(get_bool(sub, "ok"));
+    CHECK_EQ(get_str(sub, "state"), "ACTIVE");
+
+    // Fail C1
+    auto f = sim.dispatch(R"({"cmd":"crane_failed","crane_id":"C1","work_completed":30,"work_remaining":70})");
+    CHECK(get_bool(f, "ok"));
+    CHECK(!get_bool(f, "job_interrupted"));
+
+    // Check snapshot fields
+    auto snap1 = sim.dispatch(R"({"cmd":"snapshot"})");
+    auto& jobs1 = snap1.at("jobs").get<picojson::array>();
+    CHECK_EQ(jobs1.size(), (size_t)1);
+    auto& j1 = jobs1[0].get<picojson::object>();
+    CHECK_EQ(get_str(j1, "state"), "ACTIVE");
+    CHECK_EQ(get_int(j1, "required_cranes"), 2);
+    CHECK(!get_bool(j1, "crane_fulfilled"));
+    CHECK(!get_bool(j1, "can_complete"));
+
+    // Attempt premature complete -> rejected!
+    auto comp1 = sim.dispatch(R"({"cmd":"complete_job","job_id":"JOB_NEW"})");
+    CHECK(!get_bool(comp1, "ok"));
+    CHECK(get_str(comp1, "error").find("Recover the missing crane") != std::string::npos);
+
+    // Recover C1 -> tops up JOB_NEW
+    auto rec = sim.dispatch(R"({"cmd":"crane_recovered","crane_id":"C1"})");
+    CHECK(get_bool(rec, "ok"));
+    CHECK(get_bool(rec, "job_dispatched"));
+    CHECK_EQ(get_str(rec, "dispatched_job_id"), "JOB_NEW");
+
+    // Snapshot reflects crane_fulfilled=true, can_complete=true
+    auto snap2 = sim.dispatch(R"({"cmd":"snapshot"})");
+    auto& jobs2 = snap2.at("jobs").get<picojson::array>();
+    auto& j2 = jobs2[0].get<picojson::object>();
+    CHECK(get_bool(j2, "crane_fulfilled"));
+    CHECK(get_bool(j2, "can_complete"));
+
+    // Now complete succeeds
+    auto comp2 = sim.dispatch(R"({"cmd":"complete_job","job_id":"JOB_NEW"})");
+    CHECK(get_bool(comp2, "ok"));
+    CHECK_EQ(get_str(comp2, "state"), "COMPLETED");
+
+    return true;
+}
+
 // ─── main ─────────────────────────────────────────────────────────────────────
 
 int main() {
@@ -892,6 +950,7 @@ int main() {
     run_test("shutdown",                       t_shutdown);
     run_test("reinit_clears_state",            t_reinit_clears_state);
     run_test("manual_testing_scenario",        t_manual_testing_scenario);
+    run_test("multicrane_premature_complete_rejected", t_multicrane_premature_complete_rejected);
 
     std::cerr << "\n=== Results: " << g_passed << "/" << g_total << " passed";
     if (g_failed > 0) std::cerr << ", " << g_failed << " FAILED";

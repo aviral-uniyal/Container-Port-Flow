@@ -307,7 +307,16 @@ RecoveryResult PortDispatcher::on_crane_recovered(const std::string& crane_id) {
     rr.dispatched_job_id = "";
     rr.job_dispatched  = false;
 
-    // Try to dispatch a waiting job now that a crane is available.
+    // Priority 1: Fill an ACTIVE job that is undersupplied (crane failed while
+    // other cranes remained, so the job never became INTERRUPTED).
+    std::string topped_up = try_fill_undersupplied_active();
+    if (!topped_up.empty()) {
+        rr.dispatched_job_id = topped_up;
+        rr.job_dispatched    = true;
+        return rr;
+    }
+
+    // Priority 2: Dispatch an INTERRUPTED or PENDING job in the queue.
     std::string dispatched = try_dispatch();
     if (!dispatched.empty()) {
         rr.dispatched_job_id = dispatched;
@@ -315,6 +324,46 @@ RecoveryResult PortDispatcher::on_crane_recovered(const std::string& crane_id) {
     }
 
     return rr;
+}
+
+// ─── Top-up: fill undersupplied ACTIVE jobs ──────────────────────────────────────
+// Scans ACTIVE jobs in submission order and assigns available cranes to those
+// that have fewer active_cranes than job.cranes requires.  The RM allocation
+// for such a job is already fully held, so no new RM call is needed.
+
+std::string PortDispatcher::try_fill_undersupplied_active() {
+    auto avail = registry_.available_cranes();
+    if (avail.empty()) return "";
+    std::sort(avail.begin(), avail.end());
+
+    // Collect undersupplied ACTIVE jobs sorted by submission_seq.
+    std::vector<std::pair<int, std::string>> undersupplied;
+    for (const auto& kv : job_records_) {
+        if (kv.second.state == JobState::ACTIVE) {
+            const JobRecord& rec = kv.second;
+            int missing = rec.job.cranes - static_cast<int>(rec.active_cranes.size());
+            if (missing > 0) {
+                undersupplied.push_back({rec.submission_seq, kv.first});
+            }
+        }
+    }
+    if (undersupplied.empty()) return "";
+    std::sort(undersupplied.begin(), undersupplied.end());
+
+    std::string first_topped;
+    size_t avail_idx = 0;
+    for (const auto& p : undersupplied) {
+        if (avail_idx >= avail.size()) break;
+        JobRecord& rec = job_records_.at(p.second);
+        int missing = rec.job.cranes - static_cast<int>(rec.active_cranes.size());
+        for (int i = 0; i < missing && avail_idx < avail.size(); ++i, ++avail_idx) {
+            const std::string& cid = avail[avail_idx];
+            registry_.assign_crane(cid, rec.job.job_id);
+            rec.active_cranes.insert(cid);
+        }
+        if (first_topped.empty()) first_topped = p.second;
+    }
+    return first_topped;
 }
 
 // ─── Complete job ─────────────────────────────────────────────────────────────
@@ -328,6 +377,20 @@ void PortDispatcher::complete_job(const std::string& job_id) {
         throw std::invalid_argument(
             "complete_job: job " + job_id + " is not ACTIVE (state = " +
             std::to_string(static_cast<int>(rec.state)) + ").");
+    }
+
+    // Enforce full crane allocation before allowing completion.
+    // An ACTIVE job can be undersupplied when a crane failed but at least one
+    // other crane kept the job running.  Premature completion is rejected so
+    // the caller cannot bypass the resource-recovery workflow.
+    int have = static_cast<int>(rec.active_cranes.size());
+    int need = rec.job.cranes;
+    if (have < need) {
+        throw std::invalid_argument(
+            "complete_job: job " + job_id + " requires " +
+            std::to_string(need) + " crane(s) but only " +
+            std::to_string(have) + " are currently ASSIGNED. " +
+            "Recover the missing crane(s) before completing.");
     }
 
     release_job_resources(rec);
@@ -382,4 +445,9 @@ int PortDispatcher::active_count() const {
         if (kv.second.state == JobState::ACTIVE) ++count;
     }
     return count;
+}
+
+bool PortDispatcher::crane_count_fulfilled(const std::string& job_id) const {
+    const JobRecord& rec = find_record(job_id);
+    return static_cast<int>(rec.active_cranes.size()) >= rec.job.cranes;
 }
