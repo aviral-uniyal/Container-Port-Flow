@@ -37,6 +37,10 @@ class InitRequest(BaseModel):
         default=None,
         description="Scheduling policy; defaults to FCFS in C++",
     )
+    batch_mode: Optional[bool] = Field(
+        default=False,
+        description="Whether to queue jobs until explicit batch dispatch",
+    )
 
 
 class CraneRegisterRequest(BaseModel):

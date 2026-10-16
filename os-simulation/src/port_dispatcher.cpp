@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <stdexcept>
+#include <vector>
 
 // ─── Construction ─────────────────────────────────────────────────────────────
 
@@ -63,6 +64,19 @@ void PortDispatcher::validate_port_job(const PortJob& job) const {
     }
     if (job.trucks < 0) {
         throw std::invalid_argument("PortJob: trucks must be >= 0 for job " + job.job_id);
+    }
+    ResourceSet total = rm_.total_capacity();
+    if (job.berths > total.berths) {
+        throw std::invalid_argument("PortJob: requested berths (" + std::to_string(job.berths) +
+                                    ") exceeds total capacity (" + std::to_string(total.berths) + ")");
+    }
+    if (job.cranes > total.cranes) {
+        throw std::invalid_argument("PortJob: requested cranes (" + std::to_string(job.cranes) +
+                                    ") exceeds total capacity (" + std::to_string(total.cranes) + ")");
+    }
+    if (job.trucks > total.trucks) {
+        throw std::invalid_argument("PortJob: requested trucks (" + std::to_string(job.trucks) +
+                                    ") exceeds total capacity (" + std::to_string(total.trucks) + ")");
     }
 }
 
@@ -217,7 +231,33 @@ std::string PortDispatcher::try_dispatch() {
     sort_queue();
     std::string dispatched = try_dispatch_interrupted();
     if (!dispatched.empty()) return dispatched;
-    return try_dispatch_pending();
+    if (auto_dispatch_) return try_dispatch_pending();
+    return "";
+}
+
+// ─── Batch-dispatch mode ───────────────────────────────────────────────────────
+
+void PortDispatcher::set_auto_dispatch(bool enabled) {
+    auto_dispatch_ = enabled;
+}
+
+// Drain the queue: repeatedly tries to dispatch (both interrupted and pending)
+// until no job can be dispatched.  Returns the IDs of all jobs dispatched.
+//
+// Termination: each successful iteration removes exactly one entry from
+// pending_queue_.  The loop therefore runs at most N times where N is the
+// queue depth at entry.  try_dispatch_pending() returns "" immediately when
+// resources are exhausted or the queue is empty.
+std::vector<std::string> PortDispatcher::flush_dispatch() {
+    std::vector<std::string> dispatched;
+    while (true) {
+        sort_queue();
+        std::string jid = try_dispatch_interrupted();
+        if (jid.empty()) jid = try_dispatch_pending();
+        if (jid.empty()) break;
+        dispatched.push_back(jid);
+    }
+    return dispatched;
 }
 
 // ─── Job submission ────────────────────────────────────────────────────────────
@@ -316,8 +356,16 @@ RecoveryResult PortDispatcher::on_crane_recovered(const std::string& crane_id) {
         return rr;
     }
 
-    // Priority 2: Dispatch an INTERRUPTED or PENDING job in the queue.
-    std::string dispatched = try_dispatch();
+    // Priority 2: Re-dispatch an INTERRUPTED job (already holds RM resources;
+    // deferring it would leave those resources stranded indefinitely).
+    // This is resource recovery, not a new dispatch, so it runs regardless of
+    // auto_dispatch_.  Fresh PENDING jobs are only dispatched here when
+    // auto_dispatch_ is true.
+    sort_queue();
+    std::string dispatched = try_dispatch_interrupted();
+    if (dispatched.empty() && auto_dispatch_) {
+        dispatched = try_dispatch_pending();
+    }
     if (!dispatched.empty()) {
         rr.dispatched_job_id = dispatched;
         rr.job_dispatched    = true;

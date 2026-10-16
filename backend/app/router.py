@@ -207,6 +207,8 @@ def simulation_init(body: InitRequest, request: Request):
     }
     if body.policy is not None:
         cmd["policy"] = body.policy.value
+    if body.batch_mode is not None:
+        cmd["batch_mode"] = body.batch_mode
     resp = _send(bridge, cmd)
 
     # ── Persist simulation run ────────────────────────────────────────────
@@ -429,6 +431,35 @@ def simulation_snapshot(request: Request):
     """Return the full C++ simulation state snapshot."""
     bridge = _get_bridge(request)
     return _send(bridge, {"cmd": "snapshot"})
+
+
+@router.post("/simulation/dispatch")
+def simulation_dispatch(request: Request):
+    """Trigger batch dispatch of queued jobs according to the active policy."""
+    bridge = _get_bridge(request)
+    resp = _send(bridge, {"cmd": "dispatch_batch"})
+
+    dispatched_jobs = resp.get("dispatched_jobs", [])
+    run_id = getattr(request.app.state, "current_run_id", None)
+    pool = _get_db_pool(request)
+
+    if pool is not None and run_id is not None and dispatched_jobs:
+        try:
+            with get_connection(pool) as conn:
+                for jid in dispatched_jobs:
+                    update_job_status(conn, run_id=run_id, job_id=jid, status="ACTIVE")
+            logger.info(
+                "Persisted batch dispatch of %d jobs for run %d",
+                len(dispatched_jobs),
+                run_id,
+            )
+        except Exception as exc:
+            logger.warning("DB write failed for batch dispatch: %s", exc)
+
+    # Sync runtime crane assignments and statuses
+    _sync_crane_statuses(bridge, request)
+
+    return resp
 
 
 @router.post("/simulation/cranes/{crane_id}/fail")

@@ -1587,3 +1587,47 @@ class TestSimulationReconcile:
         client = TestClient(app, raise_server_exceptions=False)
         resp = client.post("/simulation/reconcile")
         assert resp.status_code == 503
+
+
+class TestBatchDispatch:
+    """POST /simulation/dispatch and batch_mode in init."""
+
+    def test_init_with_batch_mode(self):
+        """Init sends batch_mode to C++ bridge."""
+        fake = FakeBridge(response={"ok": True, "policy": "FCFS", "batch_mode": True})
+        client = _client(fake)
+        resp = client.post("/simulation/init", json={
+            "berths": 2, "cranes": 2, "trucks": 2, "policy": "FCFS", "batch_mode": True
+        })
+        assert resp.status_code == 200
+        assert fake.last_command.get("batch_mode") is True
+        assert resp.json().get("batch_mode") is True
+
+    def test_simulation_dispatch_success(self):
+        """Dispatch triggers batch flush in bridge and updates database."""
+        fake = FakeBridge(response={"ok": True, "dispatched_jobs": ["J1", "J2"], "count": 2})
+        pool = FakeDBPool(is_open=True, healthy=True)
+        client = _client(fake, pool)
+        app.state.current_run_id = 10
+
+        with patch("backend.app.router.update_job_status") as mock_update, \
+             patch("backend.app.router._sync_crane_statuses") as mock_sync:
+            resp = client.post("/simulation/dispatch")
+            assert resp.status_code == 200
+            data = resp.json()
+            assert data["ok"] is True
+            assert data["dispatched_jobs"] == ["J1", "J2"]
+            assert data["count"] == 2
+            assert fake.last_command == {"cmd": "dispatch_batch"}
+            assert mock_update.call_count == 2
+            mock_sync.assert_called_once()
+
+    def test_simulation_dispatch_bridge_down(self):
+        """Dispatch returns 503 when bridge is None (unavailable)."""
+        pool = FakeDBPool(is_open=True, healthy=True)
+        app.state.bridge = None
+        app.state.db_pool = pool
+        app.state.current_run_id = None
+        client = TestClient(app, raise_server_exceptions=False)
+        resp = client.post("/simulation/dispatch")
+        assert resp.status_code == 503

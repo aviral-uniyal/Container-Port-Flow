@@ -154,10 +154,39 @@ public:
     // Throws std::invalid_argument on duplicate or empty crane_id.
     void register_crane(const std::string& crane_id);
 
+    // ── Batch-dispatch mode ────────────────────────────────────────────────────
+
+    // Set whether submit_job / complete_job / cancel_job automatically run the
+    // dispatch pump for PENDING jobs after each call.
+    //
+    // auto_dispatch = true  (default) — existing behaviour: resources freed or
+    //   newly submitted jobs trigger try_dispatch_pending() immediately.
+    // auto_dispatch = false (batch mode) — PENDING jobs are only dispatched when
+    //   flush_dispatch() is called explicitly.  Interrupted jobs that already
+    //   hold RM resources are still re-dispatched automatically on crane recovery
+    //   because their resources are already locked; deferring them would cause
+    //   resource deadlock.
+    //
+    // Crane recovery (on_crane_recovered) always tops up undersupplied ACTIVE
+    //   jobs and re-dispatches INTERRUPTED jobs regardless of mode.  It does NOT
+    //   dispatch fresh PENDING jobs when auto_dispatch is false.
+    void set_auto_dispatch(bool enabled);
+
+    // Explicitly drain the pending queue: dispatches every eligible job in
+    // policy order until no further progress is possible (resource exhaustion or
+    // empty queue).  Returns the IDs of all newly dispatched jobs.
+    //
+    // Safe to call at any time regardless of auto_dispatch setting.
+    // Terminates reliably: each successful dispatch removes one entry from the
+    // queue; the loop stops when try_dispatch() returns "".
+    std::vector<std::string> flush_dispatch();
+
     // ── Job submission ─────────────────────────────────────────────────────────
 
-    // Enqueue a new job.  If resources are immediately available the job is
-    // dispatched (PENDING -> ACTIVE) synchronously within this call.
+    // Enqueue a new job.  If auto_dispatch is true and resources are immediately
+    // available the job is dispatched (PENDING -> ACTIVE) synchronously within
+    // this call.  If auto_dispatch is false the job remains PENDING until
+    // flush_dispatch() is called.
     //
     // Throws std::invalid_argument on:
     //   • empty job_id
@@ -261,12 +290,19 @@ public:
     const ResourceManager&   resource_manager()    const { return rm_; }
     const CraneRegistry&     crane_registry()      const { return registry_; }
     const DisruptionManager& disruption_manager()  const { return dm_; }
+    DispatchPolicy           policy()              const { return policy_; }
+    bool                     auto_dispatch()       const { return auto_dispatch_; }
 
 private:
     ResourceManager   rm_;
     CraneRegistry     registry_;
     DisruptionManager dm_;
     DispatchPolicy    policy_;
+
+    // When false, submit_job / complete_job / cancel_job do NOT call
+    // try_dispatch_pending().  Interrupted-job re-dispatch and crane top-up
+    // still happen unconditionally (they hold RM resources already).
+    bool auto_dispatch_ = true;
 
     int next_seq_ = 0;  // monotonic submission counter
 

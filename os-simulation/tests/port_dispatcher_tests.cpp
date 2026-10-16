@@ -1162,6 +1162,271 @@ static bool test_complete_validation_and_accounting_safeguards() {
 // main
 // =============================================================================
 
+
+// =============================================================================
+// Section 10 — Batch Dispatch Mode and Resource Capacity Safeguards
+// =============================================================================
+
+// ─── Test 55: Immediate dispatch compatibility (default mode) ─────────────────
+static bool test_batch_immediate_dispatch_compatibility() {
+    PortDispatcher pd(2, 2, 2, DispatchPolicy::FCFS);
+    ASSERT_TRUE(pd.auto_dispatch());
+    pd.register_crane("C1");
+
+    pd.submit_job(make_job("J1"));
+    ASSERT_TRUE(pd.job_state("J1") == JobState::ACTIVE);
+    ASSERT_EQ(pd.active_count(), 1);
+    ASSERT_EQ(pd.pending_count(), 0);
+    return true;
+}
+
+// ─── Test 56: Submissions in batch mode stay PENDING ──────────────────────────
+static bool test_batch_submissions_stay_pending() {
+    PortDispatcher pd(3, 3, 3, DispatchPolicy::FCFS);
+    pd.set_auto_dispatch(false);
+    ASSERT_FALSE(pd.auto_dispatch());
+
+    pd.register_crane("C1");
+    pd.register_crane("C2");
+
+    pd.submit_job(make_job("J1", 0, 50, 1, 1, 1, 1));
+    pd.submit_job(make_job("J2", 1, 60, 2, 1, 1, 1));
+
+    ASSERT_TRUE(pd.job_state("J1") == JobState::PENDING);
+    ASSERT_TRUE(pd.job_state("J2") == JobState::PENDING);
+    ASSERT_EQ(pd.pending_count(), 2);
+    ASSERT_EQ(pd.active_count(), 0);
+    return true;
+}
+
+// ─── Test 57: Flush dispatch in FCFS order ────────────────────────────────────
+static bool test_batch_flush_dispatch_fcfs() {
+    PortDispatcher pd(3, 3, 3, DispatchPolicy::FCFS);
+    pd.set_auto_dispatch(false);
+    pd.register_crane("C1");
+    pd.register_crane("C2");
+
+    pd.submit_job(make_job("J1", 0, 50, 5, 1, 1, 1));
+    pd.submit_job(make_job("J2", 1, 30, 1, 1, 1, 1));
+
+    std::vector<std::string> dispatched = pd.flush_dispatch();
+    ASSERT_EQ(static_cast<int>(dispatched.size()), 2);
+    ASSERT_TRUE(dispatched[0] == "J1");
+    ASSERT_TRUE(dispatched[1] == "J2");
+
+    ASSERT_TRUE(pd.job_state("J1") == JobState::ACTIVE);
+    ASSERT_TRUE(pd.job_state("J2") == JobState::ACTIVE);
+    ASSERT_EQ(pd.active_count(), 2);
+    ASSERT_EQ(pd.pending_count(), 0);
+    return true;
+}
+
+// ─── Test 58: Flush dispatch in SJF order ─────────────────────────────────────
+static bool test_batch_flush_dispatch_sjf() {
+    PortDispatcher pd(1, 1, 1, DispatchPolicy::SJF);
+    pd.set_auto_dispatch(false);
+    pd.register_crane("C1");
+
+    pd.submit_job(make_job("J_LONG",  0, 100, 1, 1, 1, 1));
+    pd.submit_job(make_job("J_SHORT", 1,  20, 5, 1, 1, 1));
+    pd.submit_job(make_job("J_MED",   2,  50, 3, 1, 1, 1));
+
+    // Only 1 crane/berth/truck available -> only shortest should be dispatched
+    std::vector<std::string> dispatched = pd.flush_dispatch();
+    ASSERT_EQ(static_cast<int>(dispatched.size()), 1);
+    ASSERT_TRUE(dispatched[0] == "J_SHORT");
+
+    ASSERT_TRUE(pd.job_state("J_SHORT") == JobState::ACTIVE);
+    ASSERT_TRUE(pd.job_state("J_LONG") == JobState::PENDING);
+    ASSERT_TRUE(pd.job_state("J_MED") == JobState::PENDING);
+    return true;
+}
+
+// ─── Test 59: Flush dispatch in Priority order ────────────────────────────────
+static bool test_batch_flush_dispatch_priority() {
+    PortDispatcher pd(1, 1, 1, DispatchPolicy::PRIORITY);
+    pd.set_auto_dispatch(false);
+    pd.register_crane("C1");
+
+    pd.submit_job(make_job("J_LOW",  0, 10, 10, 1, 1, 1));
+    pd.submit_job(make_job("J_HIGH", 1, 50,  1, 1, 1, 1));
+    pd.submit_job(make_job("J_MED",  2, 30,  5, 1, 1, 1));
+
+    std::vector<std::string> dispatched = pd.flush_dispatch();
+    ASSERT_EQ(static_cast<int>(dispatched.size()), 1);
+    ASSERT_TRUE(dispatched[0] == "J_HIGH");
+
+    ASSERT_TRUE(pd.job_state("J_HIGH") == JobState::ACTIVE);
+    ASSERT_TRUE(pd.job_state("J_LOW") == JobState::PENDING);
+    ASSERT_TRUE(pd.job_state("J_MED") == JobState::PENDING);
+    return true;
+}
+
+// ─── Test 60: Partial batch dispatch under resource contention ────────────────
+static bool test_batch_resource_contention_partial_dispatch() {
+    PortDispatcher pd(2, 2, 2, DispatchPolicy::FCFS);
+    pd.set_auto_dispatch(false);
+    pd.register_crane("C1");
+    pd.register_crane("C2");
+
+    // J1 needs 2 cranes, J2 needs 1 crane
+    pd.submit_job(make_job("J1", 0, 100, 1, 1, 2, 1));
+    pd.submit_job(make_job("J2", 1, 50,  1, 1, 1, 1));
+
+    std::vector<std::string> dispatched = pd.flush_dispatch();
+    ASSERT_EQ(static_cast<int>(dispatched.size()), 1);
+    ASSERT_TRUE(dispatched[0] == "J1");
+
+    ASSERT_TRUE(pd.job_state("J1") == JobState::ACTIVE);
+    ASSERT_TRUE(pd.job_state("J2") == JobState::PENDING);
+    ASSERT_EQ(pd.pending_count(), 1);
+
+    // Draining again with no freed resources returns empty
+    std::vector<std::string> second = pd.flush_dispatch();
+    ASSERT_TRUE(second.empty());
+    return true;
+}
+
+// ─── Test 61: Interrupted jobs prioritized over fresh pending jobs ─────────────
+static bool test_batch_interrupted_prioritized_over_pending() {
+    PortDispatcher pd(1, 1, 1, DispatchPolicy::FCFS);
+    pd.register_crane("C1");
+
+    // Start with J1 active
+    pd.submit_job(make_job("J1", 0, 100, 1, 1, 1, 1));
+    ASSERT_TRUE(pd.job_state("J1") == JobState::ACTIVE);
+
+    // Fail crane -> J1 is INTERRUPTED
+    pd.on_crane_failed("C1", 20, 80);
+    ASSERT_TRUE(pd.job_state("J1") == JobState::INTERRUPTED);
+
+    // Switch to batch mode and submit fresh pending job J2
+    pd.set_auto_dispatch(false);
+    pd.submit_job(make_job("J2", 1, 20, 1, 1, 1, 1));
+    ASSERT_TRUE(pd.job_state("J2") == JobState::PENDING);
+
+    // Recover crane: recovery automatically re-dispatches INTERRUPTED job J1
+    // because J1 already holds RM resources (preventing stranded resources),
+    // but does NOT dispatch fresh PENDING job J2.
+    RecoveryResult rr = pd.on_crane_recovered("C1");
+    ASSERT_TRUE(rr.job_dispatched);
+    ASSERT_TRUE(rr.dispatched_job_id == "J1");
+    ASSERT_TRUE(pd.job_state("J1") == JobState::ACTIVE);
+    ASSERT_TRUE(pd.job_state("J2") == JobState::PENDING);
+
+    return true;
+}
+
+// ─── Test 62: Batch mode lifecycle - complete does not auto-dispatch pending ──
+static bool test_batch_complete_job_no_pending_autodispatch() {
+    PortDispatcher pd(2, 2, 2, DispatchPolicy::FCFS);
+    pd.register_crane("C1");
+    pd.register_crane("C2");
+
+    // Submit J1 (active)
+    pd.submit_job(make_job("J1", 0, 50, 1, 1, 1, 1));
+    ASSERT_TRUE(pd.job_state("J1") == JobState::ACTIVE);
+
+    // Switch to batch mode and submit J2
+    pd.set_auto_dispatch(false);
+    pd.submit_job(make_job("J2", 1, 50, 1, 1, 1, 1));
+    ASSERT_TRUE(pd.job_state("J2") == JobState::PENDING);
+
+    // Complete J1 -> in normal mode J2 would auto-dispatch, but in batch mode
+    // J2 must remain PENDING!
+    pd.complete_job("J1");
+    ASSERT_TRUE(pd.job_state("J1") == JobState::COMPLETED);
+    ASSERT_TRUE(pd.job_state("J2") == JobState::PENDING);
+    ASSERT_EQ(pd.pending_count(), 1);
+    ASSERT_EQ(pd.active_count(), 0);
+
+    // Explicit flush dispatches J2
+    std::vector<std::string> dispatched = pd.flush_dispatch();
+    ASSERT_EQ(static_cast<int>(dispatched.size()), 1);
+    ASSERT_TRUE(dispatched[0] == "J2");
+    ASSERT_TRUE(pd.job_state("J2") == JobState::ACTIVE);
+    return true;
+}
+
+// ─── Test 63: Batch mode lifecycle - cancel does not auto-dispatch pending ────
+static bool test_batch_cancel_job_no_pending_autodispatch() {
+    PortDispatcher pd(1, 1, 1, DispatchPolicy::FCFS);
+    pd.register_crane("C1");
+
+    pd.submit_job(make_job("J1", 0, 50, 1, 1, 1, 1));
+    ASSERT_TRUE(pd.job_state("J1") == JobState::ACTIVE);
+
+    pd.set_auto_dispatch(false);
+    pd.submit_job(make_job("J2", 1, 50, 1, 1, 1, 1));
+    ASSERT_TRUE(pd.job_state("J2") == JobState::PENDING);
+
+    // Cancel J1 -> J2 must NOT be auto-dispatched
+    pd.cancel_job("J1");
+    ASSERT_TRUE(pd.job_state("J1") == JobState::CANCELLED);
+    ASSERT_TRUE(pd.job_state("J2") == JobState::PENDING);
+    return true;
+}
+
+// ─── Test 64: Batch mode - idle crane recovery does not auto-dispatch pending ──
+static bool test_batch_idle_crane_recovery_no_pending_autodispatch() {
+    PortDispatcher pd(2, 2, 2, DispatchPolicy::FCFS);
+    pd.set_auto_dispatch(false);
+    pd.register_crane("C1");
+
+    pd.submit_job(make_job("J1", 0, 50, 1, 1, 1, 1));
+    ASSERT_TRUE(pd.job_state("J1") == JobState::PENDING);
+
+    // Fail idle crane
+    pd.on_idle_crane_failed("C1");
+
+    // Recover idle crane -> should NOT dispatch J1 while in batch mode
+    RecoveryResult rr = pd.on_crane_recovered("C1");
+    ASSERT_FALSE(rr.job_dispatched);
+    ASSERT_TRUE(pd.job_state("J1") == JobState::PENDING);
+    return true;
+}
+
+// ─── Test 65: Non-preemptive behavior under batch mode ────────────────────────
+static bool test_batch_non_preemptive() {
+    PortDispatcher pd(1, 1, 1, DispatchPolicy::PRIORITY);
+    pd.register_crane("C1");
+
+    // Low priority job J1 starts running
+    pd.submit_job(make_job("J1", 0, 100, 10, 1, 1, 1));
+    ASSERT_TRUE(pd.job_state("J1") == JobState::ACTIVE);
+
+    // Switch to batch mode and submit high priority job J2
+    pd.set_auto_dispatch(false);
+    pd.submit_job(make_job("J2", 1, 20, 1, 1, 1, 1));
+    ASSERT_TRUE(pd.job_state("J2") == JobState::PENDING);
+
+    // Even if flush_dispatch is called, J1 is ACTIVE and cannot be preempted
+    std::vector<std::string> dispatched = pd.flush_dispatch();
+    ASSERT_TRUE(dispatched.empty());
+    ASSERT_TRUE(pd.job_state("J1") == JobState::ACTIVE);
+    ASSERT_TRUE(pd.job_state("J2") == JobState::PENDING);
+    return true;
+}
+
+// ─── Test 66: Resource requests exceeding total capacity throw ────────────────
+static bool test_batch_excessive_resource_requests_throw() {
+    PortDispatcher pd(2, 2, 2, DispatchPolicy::FCFS);
+
+    // Exceed berths
+    ASSERT_THROWS(pd.submit_job(make_job("J_BAD_BERTHS", 0, 10, 1, 3, 1, 1)));
+
+    // Exceed cranes
+    ASSERT_THROWS(pd.submit_job(make_job("J_BAD_CRANES", 0, 10, 1, 1, 3, 1)));
+
+    // Exceed trucks
+    ASSERT_THROWS(pd.submit_job(make_job("J_BAD_TRUCKS", 0, 10, 1, 1, 1, 3)));
+
+    // Valid job still succeeds
+    pd.submit_job(make_job("J_VALID", 0, 10, 1, 2, 2, 2));
+    ASSERT_TRUE(pd.job_state("J_VALID") == JobState::PENDING);
+    return true;
+}
+
 int main() {
     std::cout << "\n=== Port Dispatcher Integration Test Suite ===\n\n";
 
@@ -1236,6 +1501,21 @@ int main() {
     run_test("Multi-crane resume with multiple available cranes", test_multi_crane_resume_with_multiple_available_cranes);
     run_test("Confirmed live scenario regression (undersupplied completion rejected, recovered topped up)", test_confirmed_live_scenario_regression);
     run_test("Complete validation and work-accounting safeguards", test_complete_validation_and_accounting_safeguards);
+
+
+    // ── Section 10: Batch Dispatch Mode and Capacity Safeguards ──────────────
+    run_test("Batch — immediate dispatch compatibility",       test_batch_immediate_dispatch_compatibility);
+    run_test("Batch — submissions stay PENDING",                test_batch_submissions_stay_pending);
+    run_test("Batch — flush dispatch FCFS order",               test_batch_flush_dispatch_fcfs);
+    run_test("Batch — flush dispatch SJF order",                test_batch_flush_dispatch_sjf);
+    run_test("Batch — flush dispatch Priority order",           test_batch_flush_dispatch_priority);
+    run_test("Batch — resource contention partial dispatch",    test_batch_resource_contention_partial_dispatch);
+    run_test("Batch — interrupted prioritized over pending",     test_batch_interrupted_prioritized_over_pending);
+    run_test("Batch — complete does not auto-dispatch pending", test_batch_complete_job_no_pending_autodispatch);
+    run_test("Batch — cancel does not auto-dispatch pending",   test_batch_cancel_job_no_pending_autodispatch);
+    run_test("Batch — idle recovery does not dispatch pending", test_batch_idle_crane_recovery_no_pending_autodispatch);
+    run_test("Batch — non-preemptive behavior",                 test_batch_non_preemptive);
+    run_test("Batch — excessive resource requests throw",       test_batch_excessive_resource_requests_throw);
 
     std::cout << "\n─── Summary ────────────────────────\n";
     std::cout << "  Total:  " << g_total  << "\n";

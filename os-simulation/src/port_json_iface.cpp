@@ -17,6 +17,8 @@
 //   "crane_failed"      – assigned crane failure
 //   "idle_crane_failed" – idle crane failure
 //   "crane_recovered"   – repair a FAILED crane
+//   "dispatch_batch"    – trigger batch dispatch of queued jobs
+//   "set_batch_mode"    – toggle batch mode on/off
 //   "snapshot"          – dump current state
 //   "shutdown"          – graceful exit; final response then process ends
 //
@@ -167,9 +169,25 @@ static void cmd_init(const picojson::object& req) {
         g_dp = std::unique_ptr<PortDispatcher>(
             new PortDispatcher(berths, cranes, trucks, policy));
         g_known_jobs.clear();
+
+        bool batch_mode = false;
+        auto it_batch = req.find("batch_mode");
+        if (it_batch != req.end() && it_batch->second.is<bool>()) {
+            batch_mode = it_batch->second.get<bool>();
+        } else {
+            auto it_auto = req.find("auto_dispatch");
+            if (it_auto != req.end() && it_auto->second.is<bool>()) {
+                batch_mode = !it_auto->second.get<bool>();
+            }
+        }
+        if (batch_mode) {
+            g_dp->set_auto_dispatch(false);
+        }
+
         picojson::object r;
-        r["ok"]     = picojson::value(true);
-        r["policy"] = picojson::value(policy_str);
+        r["ok"]         = picojson::value(true);
+        r["policy"]     = picojson::value(policy_str);
+        r["batch_mode"] = picojson::value(batch_mode);
         emit(r);
     } catch (const std::exception& ex) {
         emit_error(ex.what());
@@ -331,12 +349,56 @@ static void cmd_crane_recovered(const picojson::object& req) {
     }
 }
 
+// "dispatch_batch": {"cmd":"dispatch_batch"}
+static void cmd_dispatch_batch(const picojson::object& /*req*/) {
+    if (!g_dp) { emit_error("dispatcher not initialised"); return; }
+    try {
+        std::vector<std::string> dispatched = g_dp->flush_dispatch();
+        picojson::object r;
+        r["ok"] = picojson::value(true);
+        picojson::array arr;
+        for (const auto& jid : dispatched) {
+            arr.push_back(picojson::value(jid));
+        }
+        r["dispatched_jobs"] = picojson::value(arr);
+        r["count"]           = picojson::value(static_cast<double>(dispatched.size()));
+        emit(r);
+    } catch (const std::exception& ex) {
+        emit_error(ex.what());
+    }
+}
+
+// "set_batch_mode": {"cmd":"set_batch_mode","batch_mode":true}
+static void cmd_set_batch_mode(const picojson::object& req) {
+    if (!g_dp) { emit_error("dispatcher not initialised"); return; }
+    bool batch_mode = true;
+    auto it_batch = req.find("batch_mode");
+    if (it_batch != req.end() && it_batch->second.is<bool>()) {
+        batch_mode = it_batch->second.get<bool>();
+    } else {
+        auto it_auto = req.find("auto_dispatch");
+        if (it_auto != req.end() && it_auto->second.is<bool>()) {
+            batch_mode = !it_auto->second.get<bool>();
+        }
+    }
+    g_dp->set_auto_dispatch(!batch_mode);
+    picojson::object r;
+    r["ok"]         = picojson::value(true);
+    r["batch_mode"] = picojson::value(batch_mode);
+    emit(r);
+}
+
 // "snapshot": {"cmd":"snapshot"}
 static void cmd_snapshot(const picojson::object& /*req*/) {
     if (!g_dp) { emit_error("dispatcher not initialised"); return; }
 
     picojson::object r;
     r["ok"] = picojson::value(true);
+    r["batch_mode"] = picojson::value(!g_dp->auto_dispatch());
+    std::string pol_s = "FCFS";
+    if (g_dp->policy() == DispatchPolicy::SJF) pol_s = "SJF";
+    else if (g_dp->policy() == DispatchPolicy::PRIORITY) pol_s = "PRIORITY";
+    r["policy"] = picojson::value(pol_s);
 
     // Resource summary
     const ResourceManager& rm = g_dp->resource_manager();
@@ -456,6 +518,8 @@ int main() {
         else if (cmd == "crane_failed")      cmd_crane_failed(req);
         else if (cmd == "idle_crane_failed") cmd_idle_crane_failed(req);
         else if (cmd == "crane_recovered")   cmd_crane_recovered(req);
+        else if (cmd == "dispatch_batch" || cmd == "dispatch") cmd_dispatch_batch(req);
+        else if (cmd == "set_batch_mode")    cmd_set_batch_mode(req);
         else if (cmd == "snapshot")          cmd_snapshot(req);
         else if (cmd == "shutdown") {
             cmd_shutdown();

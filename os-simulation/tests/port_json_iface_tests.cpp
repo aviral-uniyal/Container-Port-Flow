@@ -128,6 +128,8 @@ struct AdapterSim {
         if (cmd == "crane_failed")      return do_crane_failed(req);
         if (cmd == "idle_crane_failed") return do_idle_crane_failed(req);
         if (cmd == "crane_recovered")   return do_crane_recovered(req);
+        if (cmd == "dispatch_batch" || cmd == "dispatch") return do_dispatch_batch(req);
+        if (cmd == "set_batch_mode")    return do_set_batch_mode(req);
         if (cmd == "snapshot")          return do_snapshot();
         if (cmd == "shutdown") {
             picojson::object r;
@@ -178,7 +180,21 @@ private:
         try {
             dp = std::unique_ptr<PortDispatcher>(new PortDispatcher(berths, cranes, trucks, pol));
             known_jobs.clear(); initialised = true;
+            bool batch_mode = false;
+            auto it_batch = req.find("batch_mode");
+            if (it_batch != req.end() && it_batch->second.is<bool>()) {
+                batch_mode = it_batch->second.get<bool>();
+            } else {
+                auto it_auto = req.find("auto_dispatch");
+                if (it_auto != req.end() && it_auto->second.is<bool>()) {
+                    batch_mode = !it_auto->second.get<bool>();
+                }
+            }
+            if (batch_mode) {
+                dp->set_auto_dispatch(false);
+            }
             picojson::object r; r["ok"] = picojson::value(true); r["policy"] = picojson::value(ps);
+            r["batch_mode"] = picojson::value(batch_mode);
             return r;
         } catch (const std::exception& ex) { return err_resp(ex.what()); }
     }
@@ -297,9 +313,47 @@ private:
         } catch (const std::exception& ex) { return err_resp(ex.what()); }
     }
 
+    picojson::object do_dispatch_batch(const picojson::object& /*req*/) {
+        if (!initialised) return err_resp("dispatcher not initialised");
+        try {
+            std::vector<std::string> dispatched = dp->flush_dispatch();
+            picojson::object r;
+            r["ok"] = picojson::value(true);
+            picojson::array arr;
+            for (const auto& jid : dispatched) arr.push_back(picojson::value(jid));
+            r["dispatched_jobs"] = picojson::value(arr);
+            r["count"] = picojson::value(static_cast<double>(dispatched.size()));
+            return r;
+        } catch (const std::exception& ex) { return err_resp(ex.what()); }
+    }
+
+    picojson::object do_set_batch_mode(const picojson::object& req) {
+        if (!initialised) return err_resp("dispatcher not initialised");
+        bool batch_mode = true;
+        auto it_batch = req.find("batch_mode");
+        if (it_batch != req.end() && it_batch->second.is<bool>()) {
+            batch_mode = it_batch->second.get<bool>();
+        } else {
+            auto it_auto = req.find("auto_dispatch");
+            if (it_auto != req.end() && it_auto->second.is<bool>()) {
+                batch_mode = !it_auto->second.get<bool>();
+            }
+        }
+        dp->set_auto_dispatch(!batch_mode);
+        picojson::object r;
+        r["ok"] = picojson::value(true);
+        r["batch_mode"] = picojson::value(batch_mode);
+        return r;
+    }
+
     picojson::object do_snapshot() {
         if (!initialised) return err_resp("dispatcher not initialised");
         picojson::object r; r["ok"] = picojson::value(true);
+        r["batch_mode"] = picojson::value(!dp->auto_dispatch());
+        std::string pol_s = "FCFS";
+        if (dp->policy() == DispatchPolicy::SJF) pol_s = "SJF";
+        else if (dp->policy() == DispatchPolicy::PRIORITY) pol_s = "PRIORITY";
+        r["policy"] = picojson::value(pol_s);
         const ResourceManager& rm = dp->resource_manager();
         ResourceSet avail = rm.available(), total = rm.total_capacity();
         picojson::object res;
@@ -1113,6 +1167,140 @@ static bool t_snapshot_multiple_jobs_metadata() {
 
 // ─── main ─────────────────────────────────────────────────────────────────────
 
+
+// ─── Batch dispatch tests ─────────────────────────────────────────────────────
+
+static bool t_batch_mode_init_and_submit_stays_pending() {
+    AdapterSim sim;
+    auto r1 = sim.dispatch(R"({"cmd":"init","berths":2,"cranes":2,"trucks":2,"policy":"FCFS","batch_mode":true})");
+    CHECK(r1.at("ok").get<bool>());
+    CHECK(r1.at("batch_mode").get<bool>());
+
+    sim.dispatch(R"({"cmd":"register_crane","crane_id":"C1"})");
+
+    auto r2 = sim.dispatch(R"({"cmd":"submit_job","job_id":"J1","arrival_time":0,"work_total":10,"priority":1,"berths":1,"cranes":1,"trucks":1})");
+    CHECK(r2.at("ok").get<bool>());
+    CHECK_EQ(get_str(r2, "state"), "PENDING");
+
+    auto snap = sim.dispatch(R"({"cmd":"snapshot"})");
+    CHECK(snap.at("batch_mode").get<bool>());
+    CHECK_EQ(get_int(snap, "pending_count"), 1);
+    CHECK_EQ(get_int(snap, "active_count"), 0);
+    return true;
+}
+
+static bool t_batch_mode_dispatch_batch() {
+    AdapterSim sim;
+    sim.dispatch(R"({"cmd":"init","berths":2,"cranes":2,"trucks":2,"policy":"PRIORITY","batch_mode":true})");
+    sim.dispatch(R"({"cmd":"register_crane","crane_id":"C1"})");
+    sim.dispatch(R"({"cmd":"register_crane","crane_id":"C2"})");
+
+    sim.dispatch(R"({"cmd":"submit_job","job_id":"J_LOW","arrival_time":0,"work_total":10,"priority":5,"berths":1,"cranes":1,"trucks":1})");
+    sim.dispatch(R"({"cmd":"submit_job","job_id":"J_HIGH","arrival_time":0,"work_total":10,"priority":1,"berths":1,"cranes":1,"trucks":1})");
+
+    auto snap1 = sim.dispatch(R"({"cmd":"snapshot"})");
+    CHECK_EQ(get_int(snap1, "pending_count"), 2);
+    CHECK_EQ(get_int(snap1, "active_count"), 0);
+
+    auto r = sim.dispatch(R"({"cmd":"dispatch_batch"})");
+    CHECK(r.at("ok").get<bool>());
+    CHECK_EQ(get_int(r, "count"), 2);
+    auto jobs_arr = r.at("dispatched_jobs").get<picojson::array>();
+    CHECK_EQ(static_cast<int>(jobs_arr.size()), 2);
+    // Highest priority (lowest numeric value) should be first
+    CHECK_EQ(jobs_arr[0].get<std::string>(), "J_HIGH");
+    CHECK_EQ(jobs_arr[1].get<std::string>(), "J_LOW");
+
+    auto snap2 = sim.dispatch(R"({"cmd":"snapshot"})");
+    CHECK_EQ(get_int(snap2, "pending_count"), 0);
+    CHECK_EQ(get_int(snap2, "active_count"), 2);
+    return true;
+}
+
+static bool t_batch_mode_dynamic_toggle() {
+    AdapterSim sim;
+    sim.dispatch(R"({"cmd":"init","berths":2,"cranes":2,"trucks":2,"policy":"FCFS","batch_mode":false})");
+    sim.dispatch(R"({"cmd":"register_crane","crane_id":"C1"})");
+
+    // Toggle batch mode on
+    auto r = sim.dispatch(R"({"cmd":"set_batch_mode","batch_mode":true})");
+    CHECK(r.at("ok").get<bool>());
+    CHECK(r.at("batch_mode").get<bool>());
+
+    auto snap = sim.dispatch(R"({"cmd":"snapshot"})");
+    CHECK(snap.at("batch_mode").get<bool>());
+
+    // Submit job while in batch mode -> stays PENDING
+    auto r_sub = sim.dispatch(R"({"cmd":"submit_job","job_id":"J1","arrival_time":0,"work_total":10,"priority":1,"berths":1,"cranes":1,"trucks":1})");
+    CHECK_EQ(get_str(r_sub, "state"), "PENDING");
+
+    // Dispatch
+    auto r_disp = sim.dispatch(R"({"cmd":"dispatch_batch"})");
+    CHECK_EQ(get_int(r_disp, "count"), 1);
+    CHECK_EQ(r_disp.at("dispatched_jobs").get<picojson::array>()[0].get<std::string>(), "J1");
+
+    return true;
+}
+
+#include <fstream>
+#include <cstdlib>
+
+static bool t_actual_binary_batch_dispatch_subprocess() {
+    // Write test input script
+    std::ofstream in("test_batch_proc_in.jsonl");
+    in << "{\"cmd\":\"init\",\"berths\":2,\"cranes\":2,\"trucks\":2,\"policy\":\"FCFS\",\"batch_mode\":true}\n";
+    in << "{\"cmd\":\"register_crane\",\"crane_id\":\"C1\"}\n";
+    in << "{\"cmd\":\"submit_job\",\"job_id\":\"J1\",\"arrival_time\":0,\"work_total\":10,\"priority\":1,\"berths\":1,\"cranes\":1,\"trucks\":1}\n";
+    in << "{\"cmd\":\"snapshot\"}\n";
+    in << "{\"cmd\":\"dispatch_batch\"}\n";
+    in << "{\"cmd\":\"snapshot\"}\n";
+    in << "{\"cmd\":\"shutdown\"}\n";
+    in.close();
+
+    int rc = std::system(".\\port_json_iface.exe < test_batch_proc_in.jsonl > test_batch_proc_out.jsonl");
+    CHECK_EQ(rc, 0);
+
+    std::ifstream out("test_batch_proc_out.jsonl");
+    std::vector<picojson::object> responses;
+    std::string line;
+    while (std::getline(out, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.empty()) continue;
+        picojson::value v;
+        std::string err = picojson::parse(v, line);
+        CHECK(err.empty());
+        CHECK(v.is<picojson::object>());
+        responses.push_back(v.get<picojson::object>());
+    }
+    out.close();
+
+    std::remove("test_batch_proc_in.jsonl");
+    std::remove("test_batch_proc_out.jsonl");
+
+    CHECK_EQ(static_cast<int>(responses.size()), 7);
+    // 0: init
+    CHECK(responses[0].at("ok").get<bool>());
+    CHECK(responses[0].at("batch_mode").get<bool>());
+    // 1: register_crane
+    CHECK(responses[1].at("ok").get<bool>());
+    // 2: submit_job -> state PENDING
+    CHECK(responses[2].at("ok").get<bool>());
+    CHECK_EQ(get_str(responses[2], "state"), "PENDING");
+    // 3: snapshot before dispatch
+    CHECK_EQ(get_int(responses[3], "pending_count"), 1);
+    CHECK_EQ(get_int(responses[3], "active_count"), 0);
+    // 4: dispatch_batch -> 1 job
+    CHECK(responses[4].at("ok").get<bool>());
+    CHECK_EQ(get_int(responses[4], "count"), 1);
+    // 5: snapshot after dispatch
+    CHECK_EQ(get_int(responses[5], "pending_count"), 0);
+    CHECK_EQ(get_int(responses[5], "active_count"), 1);
+    // 6: shutdown
+    CHECK(responses[6].at("ok").get<bool>());
+
+    return true;
+}
+
 int main() {
     run_test("picojson_parse_serialize",        t_picojson_parse_serialize);
     run_test("malformed_json",                  t_malformed_json);
@@ -1147,6 +1335,10 @@ int main() {
     run_test("snapshot_job_metadata_fields",            t_snapshot_job_metadata_fields);
     run_test("snapshot_job_metadata_lifecycle_invariant", t_snapshot_job_metadata_lifecycle_invariant);
     run_test("snapshot_multiple_jobs_metadata",         t_snapshot_multiple_jobs_metadata);
+    run_test("batch_mode_init_and_submit_stays_pending", t_batch_mode_init_and_submit_stays_pending);
+    run_test("batch_mode_dispatch_batch",               t_batch_mode_dispatch_batch);
+    run_test("batch_mode_dynamic_toggle",               t_batch_mode_dynamic_toggle);
+    run_test("actual_binary_batch_dispatch_subprocess", t_actual_binary_batch_dispatch_subprocess);
 
     std::cerr << "\n=== Results: " << g_passed << "/" << g_total << " passed";
     if (g_failed > 0) std::cerr << ", " << g_failed << " FAILED";
