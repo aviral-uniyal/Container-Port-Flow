@@ -366,8 +366,12 @@ static void cmd_snapshot(const picojson::object& /*req*/) {
             jo["work_total"]      = picojson::value(static_cast<double>(rec.job.work_total));
             jo["work_remaining"]  = picojson::value(static_cast<double>(rec.work_remaining));
             jo["work_completed"]  = picojson::value(static_cast<double>(rec.work_completed));
+            jo["arrival_time"]    = picojson::value(static_cast<double>(rec.job.arrival_time));
+            jo["priority"]        = picojson::value(static_cast<double>(rec.job.priority));
             jo["rm_allocated"]    = picojson::value(rec.rm_allocated);
+            jo["required_berths"] = picojson::value(static_cast<double>(rec.job.berths));
             jo["required_cranes"] = picojson::value(static_cast<double>(rec.job.cranes));
+            jo["required_trucks"] = picojson::value(static_cast<double>(rec.job.trucks));
             bool fulfilled        = g_dp->crane_count_fulfilled(jid);
             jo["crane_fulfilled"] = picojson::value(fulfilled);
             bool can_complete     = (rec.state == JobState::ACTIVE && fulfilled);

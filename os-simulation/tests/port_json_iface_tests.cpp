@@ -330,8 +330,12 @@ private:
                 jo["work_total"]     = picojson::value((double)rec.job.work_total);
                 jo["work_remaining"] = picojson::value((double)rec.work_remaining);
                 jo["work_completed"] = picojson::value((double)rec.work_completed);
+                jo["arrival_time"]   = picojson::value((double)rec.job.arrival_time);
+                jo["priority"]       = picojson::value((double)rec.job.priority);
                 jo["rm_allocated"]   = picojson::value(rec.rm_allocated);
+                jo["required_berths"] = picojson::value((double)rec.job.berths);
                 jo["required_cranes"] = picojson::value((double)rec.job.cranes);
+                jo["required_trucks"] = picojson::value((double)rec.job.trucks);
                 bool fulfilled        = dp->crane_count_fulfilled(jid);
                 jo["crane_fulfilled"] = picojson::value(fulfilled);
                 bool can_complete     = (rec.state == JobState::ACTIVE && fulfilled);
@@ -918,6 +922,195 @@ static bool t_multicrane_premature_complete_rejected() {
     return true;
 }
 
+// T31: snapshot contains all four new metadata fields matching submitted values
+static bool t_snapshot_job_metadata_fields() {
+    AdapterSim sim;
+    sim.dispatch(R"({"cmd":"init","berths":4,"cranes":4,"trucks":8})");
+    sim.dispatch(R"({"cmd":"register_crane","crane_id":"C1"})");
+    sim.dispatch(R"({"cmd":"register_crane","crane_id":"C2"})");
+
+    auto sub = sim.dispatch(R"({"cmd":"submit_job","job_id":"J1","arrival_time":15,"work_total":20,"priority":3,"berths":2,"cranes":2,"trucks":4})");
+    CHECK(get_bool(sub, "ok"));
+
+    auto snap = sim.dispatch(R"({"cmd":"snapshot"})");
+    CHECK(get_bool(snap, "ok"));
+
+    auto& jobs = snap.at("jobs").get<picojson::array>();
+    CHECK_EQ(jobs.size(), (size_t)1);
+    auto& jo = jobs[0].get<picojson::object>();
+
+    // 1. Verify presence of all four new fields
+    CHECK(jo.find("arrival_time") != jo.end());
+    CHECK(jo.find("priority") != jo.end());
+    CHECK(jo.find("required_berths") != jo.end());
+    CHECK(jo.find("required_trucks") != jo.end());
+
+    // 2. Verify values match the submitted job
+    CHECK_EQ(get_int(jo, "arrival_time"), 15);
+    CHECK_EQ(get_int(jo, "priority"), 3);
+    CHECK_EQ(get_int(jo, "required_berths"), 2);
+    CHECK_EQ(get_int(jo, "required_trucks"), 4);
+
+    // 3. Verify all existing fields remain intact with correct values
+    CHECK_EQ(get_str(jo, "job_id"), "J1");
+    CHECK_EQ(get_str(jo, "state"), "ACTIVE");
+    CHECK_EQ(get_int(jo, "work_total"), 20);
+    CHECK_EQ(get_int(jo, "work_remaining"), 20);
+    CHECK_EQ(get_int(jo, "work_completed"), 0);
+    CHECK(get_bool(jo, "rm_allocated"));
+    CHECK_EQ(get_int(jo, "required_cranes"), 2);
+    CHECK(get_bool(jo, "crane_fulfilled"));
+    CHECK(get_bool(jo, "can_complete"));
+    auto& active_cranes = jo.at("active_cranes").get<picojson::array>();
+    CHECK_EQ(active_cranes.size(), (size_t)2);
+
+    return true;
+}
+
+// T32: job metadata fields remain invariant across job lifecycle stages
+static bool t_snapshot_job_metadata_lifecycle_invariant() {
+    AdapterSim sim;
+    sim.dispatch(R"({"cmd":"init","berths":4,"cranes":4,"trucks":4})");
+    sim.dispatch(R"({"cmd":"register_crane","crane_id":"C1"})");
+
+    // 1. ACTIVE state (J1 submitted and dispatched immediately with C1)
+    sim.dispatch(R"({"cmd":"submit_job","job_id":"J1","arrival_time":7,"work_total":10,"priority":2,"berths":1,"cranes":1,"trucks":1})");
+    auto s1 = sim.dispatch(R"({"cmd":"snapshot"})");
+    picojson::object j1_act;
+    for (auto& jv : s1.at("jobs").get<picojson::array>()) {
+        if (get_str(jv.get<picojson::object>(), "job_id") == "J1") j1_act = jv.get<picojson::object>();
+    }
+    CHECK_EQ(get_str(j1_act, "state"), "ACTIVE");
+    CHECK_EQ(get_int(j1_act, "arrival_time"), 7);
+    CHECK_EQ(get_int(j1_act, "priority"), 2);
+    CHECK_EQ(get_int(j1_act, "required_berths"), 1);
+    CHECK_EQ(get_int(j1_act, "required_cranes"), 1);
+    CHECK_EQ(get_int(j1_act, "required_trucks"), 1);
+
+    // 2. PENDING state (J2 submitted while C1 is busy -> stays PENDING)
+    sim.dispatch(R"({"cmd":"submit_job","job_id":"J2","arrival_time":12,"work_total":8,"priority":5,"berths":1,"cranes":1,"trucks":1})");
+    auto s2 = sim.dispatch(R"({"cmd":"snapshot"})");
+    picojson::object j2_pen;
+    for (auto& jv : s2.at("jobs").get<picojson::array>()) {
+        if (get_str(jv.get<picojson::object>(), "job_id") == "J2") j2_pen = jv.get<picojson::object>();
+    }
+    CHECK_EQ(get_str(j2_pen, "state"), "PENDING");
+    CHECK_EQ(get_int(j2_pen, "arrival_time"), 12);
+    CHECK_EQ(get_int(j2_pen, "priority"), 5);
+    CHECK_EQ(get_int(j2_pen, "required_berths"), 1);
+    CHECK_EQ(get_int(j2_pen, "required_cranes"), 1);
+    CHECK_EQ(get_int(j2_pen, "required_trucks"), 1);
+
+    // 3. CANCELLED state (cancel pending J2)
+    sim.dispatch(R"({"cmd":"cancel_job","job_id":"J2"})");
+    auto s3 = sim.dispatch(R"({"cmd":"snapshot"})");
+    picojson::object j2_can;
+    for (auto& jv : s3.at("jobs").get<picojson::array>()) {
+        if (get_str(jv.get<picojson::object>(), "job_id") == "J2") j2_can = jv.get<picojson::object>();
+    }
+    CHECK_EQ(get_str(j2_can, "state"), "CANCELLED");
+    CHECK_EQ(get_int(j2_can, "arrival_time"), 12);
+    CHECK_EQ(get_int(j2_can, "priority"), 5);
+    CHECK_EQ(get_int(j2_can, "required_berths"), 1);
+    CHECK_EQ(get_int(j2_can, "required_cranes"), 1);
+    CHECK_EQ(get_int(j2_can, "required_trucks"), 1);
+
+    // 4. INTERRUPTED state (C1 fails while working on J1)
+    sim.dispatch(R"({"cmd":"crane_failed","crane_id":"C1","work_completed":3,"work_remaining":7})");
+    auto s4 = sim.dispatch(R"({"cmd":"snapshot"})");
+    picojson::object j1_int;
+    for (auto& jv : s4.at("jobs").get<picojson::array>()) {
+        if (get_str(jv.get<picojson::object>(), "job_id") == "J1") j1_int = jv.get<picojson::object>();
+    }
+    CHECK_EQ(get_str(j1_int, "state"), "INTERRUPTED");
+    CHECK_EQ(get_int(j1_int, "work_completed"), 3);
+    CHECK_EQ(get_int(j1_int, "work_remaining"), 7);
+    CHECK_EQ(get_int(j1_int, "arrival_time"), 7);
+    CHECK_EQ(get_int(j1_int, "priority"), 2);
+    CHECK_EQ(get_int(j1_int, "required_berths"), 1);
+    CHECK_EQ(get_int(j1_int, "required_cranes"), 1);
+    CHECK_EQ(get_int(j1_int, "required_trucks"), 1);
+
+    // 5. Resumed ACTIVE state (C1 recovered -> J1 re-dispatched)
+    sim.dispatch(R"({"cmd":"crane_recovered","crane_id":"C1"})");
+    auto s5 = sim.dispatch(R"({"cmd":"snapshot"})");
+    picojson::object j1_act2;
+    for (auto& jv : s5.at("jobs").get<picojson::array>()) {
+        if (get_str(jv.get<picojson::object>(), "job_id") == "J1") j1_act2 = jv.get<picojson::object>();
+    }
+    CHECK_EQ(get_str(j1_act2, "state"), "ACTIVE");
+    CHECK_EQ(get_int(j1_act2, "arrival_time"), 7);
+    CHECK_EQ(get_int(j1_act2, "priority"), 2);
+    CHECK_EQ(get_int(j1_act2, "required_berths"), 1);
+    CHECK_EQ(get_int(j1_act2, "required_cranes"), 1);
+    CHECK_EQ(get_int(j1_act2, "required_trucks"), 1);
+
+    // 6. COMPLETED state (complete J1)
+    sim.dispatch(R"({"cmd":"complete_job","job_id":"J1"})");
+    auto s6 = sim.dispatch(R"({"cmd":"snapshot"})");
+    picojson::object j1_cmp;
+    for (auto& jv : s6.at("jobs").get<picojson::array>()) {
+        if (get_str(jv.get<picojson::object>(), "job_id") == "J1") j1_cmp = jv.get<picojson::object>();
+    }
+    CHECK_EQ(get_str(j1_cmp, "state"), "COMPLETED");
+    CHECK_EQ(get_int(j1_cmp, "work_completed"), 10);
+    CHECK_EQ(get_int(j1_cmp, "work_remaining"), 0);
+    CHECK_EQ(get_int(j1_cmp, "arrival_time"), 7);
+    CHECK_EQ(get_int(j1_cmp, "priority"), 2);
+    CHECK_EQ(get_int(j1_cmp, "required_berths"), 1);
+    CHECK_EQ(get_int(j1_cmp, "required_cranes"), 1);
+    CHECK_EQ(get_int(j1_cmp, "required_trucks"), 1);
+
+    return true;
+}
+
+// T33: snapshot with multiple jobs preserves distinct metadata per job
+static bool t_snapshot_multiple_jobs_metadata() {
+    AdapterSim sim;
+    sim.dispatch(R"({"cmd":"init","berths":10,"cranes":10,"trucks":20})");
+    sim.dispatch(R"({"cmd":"register_crane","crane_id":"C1"})");
+    sim.dispatch(R"({"cmd":"register_crane","crane_id":"C2"})");
+    sim.dispatch(R"({"cmd":"register_crane","crane_id":"C3"})");
+
+    sim.dispatch(R"({"cmd":"submit_job","job_id":"JOB_A","arrival_time":1,"work_total":10,"priority":1,"berths":1,"cranes":1,"trucks":2})");
+    sim.dispatch(R"({"cmd":"submit_job","job_id":"JOB_B","arrival_time":10,"work_total":25,"priority":3,"berths":2,"cranes":1,"trucks":5})");
+    sim.dispatch(R"({"cmd":"submit_job","job_id":"JOB_C","arrival_time":20,"work_total":15,"priority":2,"berths":3,"cranes":1,"trucks":0})");
+
+    auto snap = sim.dispatch(R"({"cmd":"snapshot"})");
+    auto& jobs = snap.at("jobs").get<picojson::array>();
+    CHECK_EQ(jobs.size(), (size_t)3);
+
+    int matched = 0;
+    for (auto& jv : jobs) {
+        auto& jo = jv.get<picojson::object>();
+        std::string jid = get_str(jo, "job_id");
+        if (jid == "JOB_A") {
+            CHECK_EQ(get_int(jo, "arrival_time"), 1);
+            CHECK_EQ(get_int(jo, "priority"), 1);
+            CHECK_EQ(get_int(jo, "required_berths"), 1);
+            CHECK_EQ(get_int(jo, "required_cranes"), 1);
+            CHECK_EQ(get_int(jo, "required_trucks"), 2);
+            ++matched;
+        } else if (jid == "JOB_B") {
+            CHECK_EQ(get_int(jo, "arrival_time"), 10);
+            CHECK_EQ(get_int(jo, "priority"), 3);
+            CHECK_EQ(get_int(jo, "required_berths"), 2);
+            CHECK_EQ(get_int(jo, "required_cranes"), 1);
+            CHECK_EQ(get_int(jo, "required_trucks"), 5);
+            ++matched;
+        } else if (jid == "JOB_C") {
+            CHECK_EQ(get_int(jo, "arrival_time"), 20);
+            CHECK_EQ(get_int(jo, "priority"), 2);
+            CHECK_EQ(get_int(jo, "required_berths"), 3);
+            CHECK_EQ(get_int(jo, "required_cranes"), 1);
+            CHECK_EQ(get_int(jo, "required_trucks"), 0);
+            ++matched;
+        }
+    }
+    CHECK_EQ(matched, 3);
+    return true;
+}
+
 // ─── main ─────────────────────────────────────────────────────────────────────
 
 int main() {
@@ -951,6 +1144,9 @@ int main() {
     run_test("reinit_clears_state",            t_reinit_clears_state);
     run_test("manual_testing_scenario",        t_manual_testing_scenario);
     run_test("multicrane_premature_complete_rejected", t_multicrane_premature_complete_rejected);
+    run_test("snapshot_job_metadata_fields",            t_snapshot_job_metadata_fields);
+    run_test("snapshot_job_metadata_lifecycle_invariant", t_snapshot_job_metadata_lifecycle_invariant);
+    run_test("snapshot_multiple_jobs_metadata",         t_snapshot_multiple_jobs_metadata);
 
     std::cerr << "\n=== Results: " << g_passed << "/" << g_total << " passed";
     if (g_failed > 0) std::cerr << ", " << g_failed << " FAILED";
