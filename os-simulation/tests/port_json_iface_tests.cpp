@@ -19,11 +19,13 @@
 #include "port_dispatcher.h"
 
 #include <cassert>
+#include <algorithm>
 #include <iostream>
 #include <memory>
 #include <sstream>
 #include <string>
 #include <unordered_set>
+#include <unordered_map>
 #include <vector>
 
 // ─── Minimal test infrastructure ─────────────────────────────────────────────
@@ -366,8 +368,19 @@ private:
         r["resources"] = picojson::value(res);
         r["pending_count"] = picojson::value((double)dp->pending_count());
         r["active_count"]  = picojson::value((double)dp->active_count());
+        std::vector<std::string> ordered_queue = dp->ordered_queue();
+        std::unordered_map<std::string, int> queue_positions;
+        for (size_t i = 0; i < ordered_queue.size(); ++i) {
+            queue_positions[ordered_queue[i]] = static_cast<int>(i) + 1;
+        }
+        std::vector<std::string> stable_jobs(known_jobs.begin(), known_jobs.end());
+        std::sort(stable_jobs.begin(), stable_jobs.end(),
+            [this](const std::string& a, const std::string& b) {
+                return dp->job_record(a).submission_seq < dp->job_record(b).submission_seq;
+            });
+
         picojson::array jobs_arr;
-        for (const std::string& jid : known_jobs) {
+        for (const std::string& jid : stable_jobs) {
             try {
                 const JobRecord& rec = dp->job_record(jid);
                 picojson::object jo;
@@ -386,6 +399,11 @@ private:
                 jo["work_completed"] = picojson::value((double)rec.work_completed);
                 jo["arrival_time"]   = picojson::value((double)rec.job.arrival_time);
                 jo["priority"]       = picojson::value((double)rec.job.priority);
+                jo["submission_seq"] = picojson::value((double)rec.submission_seq);
+                auto qpos = queue_positions.find(jid);
+                if (qpos != queue_positions.end()) {
+                    jo["queue_position"] = picojson::value((double)qpos->second);
+                }
                 jo["rm_allocated"]   = picojson::value(rec.rm_allocated);
                 jo["required_berths"] = picojson::value((double)rec.job.berths);
                 jo["required_cranes"] = picojson::value((double)rec.job.cranes);
@@ -1165,6 +1183,35 @@ static bool t_snapshot_multiple_jobs_metadata() {
     return true;
 }
 
+// Snapshot job order is stable by submission, while queue_position reflects
+// the live dispatch policy independently of the JSON array order.
+static bool t_snapshot_queue_order_is_authoritative_and_deterministic() {
+    AdapterSim sim;
+    sim.dispatch(R"({"cmd":"init","berths":2,"cranes":2,"trucks":2,"policy":"SJF","batch_mode":true})");
+    sim.dispatch(R"({"cmd":"submit_job","job_id":"LONG","arrival_time":99,"work_total":30,"priority":5,"berths":1,"cranes":1,"trucks":1})");
+    sim.dispatch(R"({"cmd":"submit_job","job_id":"SHORT_A","arrival_time":0,"work_total":10,"priority":5,"berths":1,"cranes":1,"trucks":1})");
+    sim.dispatch(R"({"cmd":"submit_job","job_id":"SHORT_B","arrival_time":1,"work_total":10,"priority":1,"berths":1,"cranes":1,"trucks":1})");
+
+    auto first = sim.dispatch(R"({"cmd":"snapshot"})");
+    auto second = sim.dispatch(R"({"cmd":"snapshot"})");
+    auto& jobs1 = first.at("jobs").get<picojson::array>();
+    auto& jobs2 = second.at("jobs").get<picojson::array>();
+    CHECK_EQ(jobs1.size(), (size_t)3);
+    CHECK_EQ(jobs2.size(), (size_t)3);
+
+    const char* submitted[] = {"LONG", "SHORT_A", "SHORT_B"};
+    const int queue_positions[] = {3, 1, 2};
+    for (size_t i = 0; i < jobs1.size(); ++i) {
+        auto& a = jobs1[i].get<picojson::object>();
+        auto& b = jobs2[i].get<picojson::object>();
+        CHECK_EQ(get_str(a, "job_id"), std::string(submitted[i]));
+        CHECK_EQ(get_str(b, "job_id"), std::string(submitted[i]));
+        CHECK_EQ(get_int(a, "submission_seq"), static_cast<int>(i));
+        CHECK_EQ(get_int(a, "queue_position"), queue_positions[i]);
+    }
+    return true;
+}
+
 // ─── main ─────────────────────────────────────────────────────────────────────
 
 
@@ -1289,6 +1336,11 @@ static bool t_actual_binary_batch_dispatch_subprocess() {
     // 3: snapshot before dispatch
     CHECK_EQ(get_int(responses[3], "pending_count"), 1);
     CHECK_EQ(get_int(responses[3], "active_count"), 0);
+    auto& pending_jobs = responses[3].at("jobs").get<picojson::array>();
+    CHECK_EQ(pending_jobs.size(), (size_t)1);
+    auto& pending_job = pending_jobs[0].get<picojson::object>();
+    CHECK_EQ(get_int(pending_job, "submission_seq"), 0);
+    CHECK_EQ(get_int(pending_job, "queue_position"), 1);
     // 4: dispatch_batch -> 1 job
     CHECK(responses[4].at("ok").get<bool>());
     CHECK_EQ(get_int(responses[4], "count"), 1);
@@ -1335,6 +1387,7 @@ int main() {
     run_test("snapshot_job_metadata_fields",            t_snapshot_job_metadata_fields);
     run_test("snapshot_job_metadata_lifecycle_invariant", t_snapshot_job_metadata_lifecycle_invariant);
     run_test("snapshot_multiple_jobs_metadata",         t_snapshot_multiple_jobs_metadata);
+    run_test("snapshot_queue_order_authoritative",      t_snapshot_queue_order_is_authoritative_and_deterministic);
     run_test("batch_mode_init_and_submit_stays_pending", t_batch_mode_init_and_submit_stays_pending);
     run_test("batch_mode_dispatch_batch",               t_batch_mode_dispatch_batch);
     run_test("batch_mode_dynamic_toggle",               t_batch_mode_dynamic_toggle);

@@ -92,39 +92,44 @@ void PortDispatcher::remove_from_queue(const std::string& job_id) {
 // INTERRUPTED jobs are given precedence over PENDING jobs with the same key to
 // avoid starvation (they already hold RM resources).
 
+bool PortDispatcher::queue_precedes(const std::string& a,
+                                    const std::string& b) const {
+    const JobRecord& ra = job_records_.at(a);
+    const JobRecord& rb = job_records_.at(b);
+
+    // INTERRUPTED before PENDING (same logical priority, same key).
+    bool a_interrupted = (ra.state == JobState::INTERRUPTED);
+    bool b_interrupted = (rb.state == JobState::INTERRUPTED);
+
+    switch (policy_) {
+        case DispatchPolicy::FCFS:
+            // Primary: interrupted first.  Secondary: submission order.
+            if (a_interrupted != b_interrupted) return a_interrupted > b_interrupted;
+            return ra.submission_seq < rb.submission_seq;
+
+        case DispatchPolicy::SJF:
+            // Primary: interrupted first.  Secondary: shorter remaining work.
+            // Tiebreak: submission order.
+            if (a_interrupted != b_interrupted) return a_interrupted > b_interrupted;
+            if (ra.work_remaining != rb.work_remaining)
+                return ra.work_remaining < rb.work_remaining;
+            return ra.submission_seq < rb.submission_seq;
+
+        case DispatchPolicy::PRIORITY:
+            // Primary: interrupted first.  Secondary: lower priority number.
+            // Tiebreak: submission order.
+            if (a_interrupted != b_interrupted) return a_interrupted > b_interrupted;
+            if (ra.job.priority != rb.job.priority)
+                return ra.job.priority < rb.job.priority;
+            return ra.submission_seq < rb.submission_seq;
+    }
+    return false; // unreachable
+}
+
 void PortDispatcher::sort_queue() {
     std::stable_sort(pending_queue_.begin(), pending_queue_.end(),
         [this](const std::string& a, const std::string& b) {
-            const JobRecord& ra = job_records_.at(a);
-            const JobRecord& rb = job_records_.at(b);
-
-            // INTERRUPTED before PENDING (same logical priority, same key).
-            bool a_interrupted = (ra.state == JobState::INTERRUPTED);
-            bool b_interrupted = (rb.state == JobState::INTERRUPTED);
-
-            switch (policy_) {
-                case DispatchPolicy::FCFS:
-                    // Primary: interrupted first.  Secondary: submission order.
-                    if (a_interrupted != b_interrupted) return a_interrupted > b_interrupted;
-                    return ra.submission_seq < rb.submission_seq;
-
-                case DispatchPolicy::SJF:
-                    // Primary: interrupted first.  Secondary: shorter remaining work.
-                    // Tiebreak: submission order.
-                    if (a_interrupted != b_interrupted) return a_interrupted > b_interrupted;
-                    if (ra.work_remaining != rb.work_remaining)
-                        return ra.work_remaining < rb.work_remaining;
-                    return ra.submission_seq < rb.submission_seq;
-
-                case DispatchPolicy::PRIORITY:
-                    // Primary: interrupted first.  Secondary: lower priority number.
-                    // Tiebreak: submission order.
-                    if (a_interrupted != b_interrupted) return a_interrupted > b_interrupted;
-                    if (ra.job.priority != rb.job.priority)
-                        return ra.job.priority < rb.job.priority;
-                    return ra.submission_seq < rb.submission_seq;
-            }
-            return false; // unreachable
+            return queue_precedes(a, b);
         });
 }
 
@@ -481,6 +486,15 @@ JobState PortDispatcher::job_state(const std::string& job_id) const {
 
 const JobRecord& PortDispatcher::job_record(const std::string& job_id) const {
     return find_record(job_id);
+}
+
+std::vector<std::string> PortDispatcher::ordered_queue() const {
+    std::vector<std::string> ordered(pending_queue_.begin(), pending_queue_.end());
+    std::stable_sort(ordered.begin(), ordered.end(),
+        [this](const std::string& a, const std::string& b) {
+            return queue_precedes(a, b);
+        });
+    return ordered;
 }
 
 int PortDispatcher::pending_count() const {

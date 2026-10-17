@@ -15,6 +15,32 @@ export default function JobsTable({ jobs = [], onComplete, loading = {} }) {
     FAILED:    'badge badge--failed',
   }
 
+  // Keep running work separate from the dispatch queue, then show queued jobs
+  // in the exact order calculated by PortDispatcher.  submission_seq provides
+  // deterministic ordering for non-queued jobs and compatibility fallback.
+  const stateGroup = state => {
+    if (state === 'ACTIVE') return 0
+    if (state === 'PENDING' || state === 'INTERRUPTED') return 1
+    return 2
+  }
+  const displayJobs = [...jobs].sort((a, b) => {
+    const groupDifference = stateGroup(a.state) - stateGroup(b.state)
+    if (groupDifference !== 0) return groupDifference
+
+    const aQueued = a.state === 'PENDING' || a.state === 'INTERRUPTED'
+    const bQueued = b.state === 'PENDING' || b.state === 'INTERRUPTED'
+    if (aQueued && bQueued) {
+      const aPosition = Number.isFinite(a.queue_position) ? a.queue_position : Number.MAX_SAFE_INTEGER
+      const bPosition = Number.isFinite(b.queue_position) ? b.queue_position : Number.MAX_SAFE_INTEGER
+      if (aPosition !== bPosition) return aPosition - bPosition
+    }
+
+    const sequenceDifference = (a.submission_seq ?? Number.MAX_SAFE_INTEGER) -
+      (b.submission_seq ?? Number.MAX_SAFE_INTEGER)
+    if (sequenceDifference !== 0) return sequenceDifference
+    return String(a.job_id).localeCompare(String(b.job_id))
+  })
+
   return (
     <section className="card" aria-labelledby="jobs-table-title">
       <div className="card__header">
@@ -43,7 +69,7 @@ export default function JobsTable({ jobs = [], onComplete, loading = {} }) {
                 </td>
               </tr>
             ) : (
-              jobs.map(job => (
+              displayJobs.map(job => (
                 <tr key={job.job_id}>
                   <td>
                     <code style={{ fontFamily: 'monospace', fontSize: '0.8125rem' }}>

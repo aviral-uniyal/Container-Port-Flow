@@ -280,6 +280,11 @@ public:
     // Throws std::invalid_argument if unknown.
     const JobRecord& job_record(const std::string& job_id) const;
 
+    // Job IDs in the exact order used by the live dispatch queue.  Includes
+    // both PENDING and INTERRUPTED jobs; INTERRUPTED precedence and all policy
+    // tie-breaks are applied by the same comparator used for dispatch.
+    std::vector<std::string> ordered_queue() const;
+
     // Number of jobs in PENDING or INTERRUPTED state (in the dispatch queue).
     int pending_count() const;
 
@@ -342,6 +347,9 @@ private:
 
     // Sort the pending queue according to the active policy.
     void sort_queue();
+
+    // Shared ordering predicate used by dispatch and read-only queue snapshots.
+    bool queue_precedes(const std::string& a, const std::string& b) const;
 
     // Release RM + CraneRegistry resources for a job.
     void release_job_resources(JobRecord& rec);

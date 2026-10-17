@@ -42,11 +42,13 @@
 #include "port_dispatcher.h"
 
 #include <iostream>
+#include <algorithm>
 #include <memory>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <unordered_set>
+#include <unordered_map>
 #include <vector>
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -417,9 +419,23 @@ static void cmd_snapshot(const picojson::object& /*req*/) {
     r["pending_count"] = picojson::value(static_cast<double>(g_dp->pending_count()));
     r["active_count"]  = picojson::value(static_cast<double>(g_dp->active_count()));
 
-    // Jobs
+    // Jobs.  Serialize in stable submission order, and expose the live
+    // dispatcher's authoritative queue position for queued jobs.
+    std::vector<std::string> ordered_queue = g_dp->ordered_queue();
+    std::unordered_map<std::string, int> queue_positions;
+    for (size_t i = 0; i < ordered_queue.size(); ++i) {
+        queue_positions[ordered_queue[i]] = static_cast<int>(i) + 1;
+    }
+
+    std::vector<std::string> known_jobs(g_known_jobs.begin(), g_known_jobs.end());
+    std::sort(known_jobs.begin(), known_jobs.end(),
+        [](const std::string& a, const std::string& b) {
+            return g_dp->job_record(a).submission_seq <
+                   g_dp->job_record(b).submission_seq;
+        });
+
     picojson::array jobs_arr;
-    for (const std::string& jid : g_known_jobs) {
+    for (const std::string& jid : known_jobs) {
         try {
             const JobRecord& rec = g_dp->job_record(jid);
             picojson::object jo;
@@ -430,6 +446,11 @@ static void cmd_snapshot(const picojson::object& /*req*/) {
             jo["work_completed"]  = picojson::value(static_cast<double>(rec.work_completed));
             jo["arrival_time"]    = picojson::value(static_cast<double>(rec.job.arrival_time));
             jo["priority"]        = picojson::value(static_cast<double>(rec.job.priority));
+            jo["submission_seq"]  = picojson::value(static_cast<double>(rec.submission_seq));
+            auto qpos = queue_positions.find(jid);
+            if (qpos != queue_positions.end()) {
+                jo["queue_position"] = picojson::value(static_cast<double>(qpos->second));
+            }
             jo["rm_allocated"]    = picojson::value(rec.rm_allocated);
             jo["required_berths"] = picojson::value(static_cast<double>(rec.job.berths));
             jo["required_cranes"] = picojson::value(static_cast<double>(rec.job.cranes));

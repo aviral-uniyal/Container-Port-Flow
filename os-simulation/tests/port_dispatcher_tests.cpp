@@ -1262,6 +1262,38 @@ static bool test_batch_flush_dispatch_priority() {
     return true;
 }
 
+// The read-only queue view used by snapshots must share the dispatch
+// comparator, including submission-order tie-breaks.
+static bool test_ordered_queue_matches_live_policy() {
+    {
+        PortDispatcher pd(3, 3, 3, DispatchPolicy::FCFS);
+        pd.set_auto_dispatch(false);
+        pd.submit_job(make_job("F1", 50, 30, 9));
+        pd.submit_job(make_job("F2", 0, 10, 1));
+        auto queue = pd.ordered_queue();
+        ASSERT_TRUE(queue == std::vector<std::string>({"F1", "F2"}));
+    }
+    {
+        PortDispatcher pd(3, 3, 3, DispatchPolicy::SJF);
+        pd.set_auto_dispatch(false);
+        pd.submit_job(make_job("LONG", 0, 30));
+        pd.submit_job(make_job("SHORT_FIRST", 0, 10));
+        pd.submit_job(make_job("SHORT_SECOND", 0, 10));
+        auto queue = pd.ordered_queue();
+        ASSERT_TRUE(queue == std::vector<std::string>({"SHORT_FIRST", "SHORT_SECOND", "LONG"}));
+    }
+    {
+        PortDispatcher pd(3, 3, 3, DispatchPolicy::PRIORITY);
+        pd.set_auto_dispatch(false);
+        pd.submit_job(make_job("LOW", 0, 10, 5));
+        pd.submit_job(make_job("HIGH_FIRST", 0, 20, 1));
+        pd.submit_job(make_job("HIGH_SECOND", 0, 5, 1));
+        auto queue = pd.ordered_queue();
+        ASSERT_TRUE(queue == std::vector<std::string>({"HIGH_FIRST", "HIGH_SECOND", "LOW"}));
+    }
+    return true;
+}
+
 // ─── Test 60: Partial batch dispatch under resource contention ────────────────
 static bool test_batch_resource_contention_partial_dispatch() {
     PortDispatcher pd(2, 2, 2, DispatchPolicy::FCFS);
@@ -1509,6 +1541,7 @@ int main() {
     run_test("Batch — flush dispatch FCFS order",               test_batch_flush_dispatch_fcfs);
     run_test("Batch — flush dispatch SJF order",                test_batch_flush_dispatch_sjf);
     run_test("Batch — flush dispatch Priority order",           test_batch_flush_dispatch_priority);
+    run_test("Queue snapshot — live policy and stable ties",     test_ordered_queue_matches_live_policy);
     run_test("Batch — resource contention partial dispatch",    test_batch_resource_contention_partial_dispatch);
     run_test("Batch — interrupted prioritized over pending",     test_batch_interrupted_prioritized_over_pending);
     run_test("Batch — complete does not auto-dispatch pending", test_batch_complete_job_no_pending_autodispatch);
