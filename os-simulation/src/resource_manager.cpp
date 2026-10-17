@@ -39,7 +39,7 @@ int ResourceManager::active_job_count() const {
 }
 
 bool ResourceManager::has_active_job(const std::string& job_id) const {
-    return active_allocations_.count(job_id) > 0;
+    return active_allocations_.find(job_id) != active_allocations_.end();
 }
 
 ResourceSet ResourceManager::get_job_allocation(const std::string& job_id) const {
@@ -84,7 +84,7 @@ bool ResourceManager::can_allocate(const ResourceRequest& req) const {
 bool ResourceManager::allocate(const ResourceRequest& req) {
     validate_request(req);
 
-    if (active_allocations_.count(req.job_id) > 0) {
+    if (active_allocations_.find(req.job_id) != active_allocations_.end()) {
         throw std::invalid_argument(
             "Duplicate active allocation for job " + req.job_id);
     }
