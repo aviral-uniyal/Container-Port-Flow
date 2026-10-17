@@ -9,6 +9,10 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
+class SimulationPersistenceError(RuntimeError):
+    """The C++ step succeeded but its snapshot could not be persisted."""
+
+
 class SimulationExecution:
     def __init__(self, bridge: Any) -> None:
         self.bridge = bridge
@@ -19,6 +23,7 @@ class SimulationExecution:
         self.state = "paused"
         self.error: str | None = None
         self.interval = 1.0
+        self.on_snapshot = None
 
     def status(self) -> dict[str, Any]:
         return {"state": self.state, "interval_seconds": self.interval,
@@ -35,10 +40,17 @@ class SimulationExecution:
         async with self.lock:
             if self.state == "running" and not continue_batch:
                 raise RuntimeError("Pause automatic execution before stepping manually")
-            return await asyncio.to_thread(
+            result = await asyncio.to_thread(
                 self._send, self.bridge,
                 {"cmd": "step", "continue_batch": continue_batch},
             )
+            if self.on_snapshot is not None:
+                snapshot = await asyncio.to_thread(self._send, self.bridge, {"cmd": "snapshot"})
+                try:
+                    await asyncio.to_thread(self.on_snapshot, snapshot)
+                except Exception as exc:
+                    raise SimulationPersistenceError(str(exc)) from exc
+            return result
 
     async def run(self, interval: float) -> dict[str, Any]:
         async with self.transition_lock:
@@ -57,10 +69,17 @@ class SimulationExecution:
             await self._stop_runner()
             return self.status()
 
-    async def reset(self, command: dict[str, Any]) -> dict[str, Any]:
+    async def reset(self, command: dict[str, Any], before_reset=None,
+                    capture_snapshot=False) -> dict[str, Any]:
         async with self.transition_lock:
             await self._stop_runner()
             async with self.lock:
+                if before_reset is not None:
+                    needs_snapshot = (capture_snapshot() if callable(capture_snapshot)
+                                      else capture_snapshot)
+                    snapshot = (await asyncio.to_thread(self._send, self.bridge, {"cmd": "snapshot"})
+                                if needs_snapshot else None)
+                    await asyncio.to_thread(before_reset, snapshot)
                 response = await asyncio.to_thread(self._send, self.bridge, command)
                 self.state = "paused"
                 self.error = None
@@ -89,6 +108,8 @@ class SimulationExecution:
                     snapshot = await asyncio.to_thread(
                         self._send, self.bridge, {"cmd": "snapshot"},
                     )
+                    if self.on_snapshot is not None:
+                        await asyncio.to_thread(self.on_snapshot, snapshot)
                     jobs = snapshot.get("jobs", [])
                     unfinished = any(
                         job.get("state") in ("PENDING", "ACTIVE", "INTERRUPTED")

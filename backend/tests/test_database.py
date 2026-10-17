@@ -15,7 +15,10 @@ import pytest
 from backend.app.config import get_db_config
 from backend.app.database import (
     DatabasePool,
+    cancel_unfinished_jobs_for_run,
     check_connection,
+    close_simulation_run,
+    get_active_assignments_for_run,
     get_connection,
     get_crane,
     get_disruption_events_for_run,
@@ -27,6 +30,8 @@ from backend.app.database import (
     insert_disruption_event,
     insert_simulation_job,
     insert_simulation_run,
+    make_assigned_cranes_available,
+    release_active_assignments_for_run,
     release_active_crane_assignment_by_crane,
     release_active_crane_assignments_by_job,
     release_crane_assignment,
@@ -36,6 +41,47 @@ from backend.app.database import (
     update_job_work_progress,
     upsert_crane,
 )
+
+
+def test_reset_queries_are_scoped_and_preserve_failed_cranes() -> None:
+    conn = MagicMock()
+    cursor = conn.cursor.return_value.__enter__.return_value
+    cursor.rowcount = 2
+    cancel_unfinished_jobs_for_run(conn, 7)
+    sql, params = cursor.execute.call_args.args
+    assert "run_id = %(run_id)s" in sql
+    assert "status IN ('PENDING', 'ACTIVE', 'INTERRUPTED')" in sql
+    assert params == {"run_id": 7}
+
+    release_active_assignments_for_run(conn, 7, "SIMULATION_RESET")
+    sql, params = cursor.execute.call_args.args
+    assert "j.run_id = %(run_id)s" in sql
+    assert "a.released_at IS NULL" in sql
+    assert params == {"run_id": 7, "reason": "SIMULATION_RESET"}
+
+    make_assigned_cranes_available(conn, ["C1"])
+    sql, params = cursor.execute.call_args.args
+    assert "status = 'ASSIGNED'" in sql
+    assert params == {"crane_ids": ["C1"]}
+
+    close_simulation_run(conn, 7, "COMPLETED")
+    sql, params = cursor.execute.call_args.args
+    assert "status = 'RUNNING'" in sql
+    assert "ended_at = now()" in sql
+    assert params == {"run_id": 7, "status": "COMPLETED"}
+
+
+def test_active_assignment_query_joins_jobs_by_run() -> None:
+    conn = MagicMock()
+    cursor = conn.cursor.return_value.__enter__.return_value
+    cursor.fetchall.return_value = [{"assignment_id": 1, "crane_id": "C1",
+                                      "simulation_job_id": 11, "job_id": "J1"}]
+    rows = get_active_assignments_for_run(conn, 7)
+    assert len(rows) == 1
+    sql, params = cursor.execute.call_args.args
+    assert "JOIN simulation_jobs" in sql
+    assert "j.run_id = %(run_id)s" in sql
+    assert params == {"run_id": 7}
 
 
 # ─── 1. Configuration tests ───────────────────────────────────────────────────
@@ -318,6 +364,7 @@ class TestSimulationSchemaQueries:
         mock_cur = MagicMock()
         mock_conn.cursor.return_value.__enter__.return_value = mock_cur
         mock_cur.rowcount = 1
+        mock_cur.fetchone.return_value = ("AVAILABLE",)
 
         statuses = [
             {"crane_id": "C1", "status": "ASSIGNED"},
@@ -325,7 +372,14 @@ class TestSimulationSchemaQueries:
         ]
         count = batch_sync_crane_statuses(mock_conn, statuses)
         assert count == 2
-        assert mock_cur.execute.call_count == 2
+        assert mock_cur.execute.call_count == 4
+
+    def test_batch_sync_does_not_touch_unchanged_status(self) -> None:
+        mock_conn = MagicMock()
+        mock_cur = mock_conn.cursor.return_value.__enter__.return_value
+        mock_cur.fetchone.return_value = ("FAILED",)
+        assert batch_sync_crane_statuses(mock_conn, [{"crane_id": "C1", "status": "FAILED"}]) == 1
+        assert mock_cur.execute.call_count == 1
 
     def test_batch_sync_crane_statuses_empty_list(self) -> None:
         mock_conn = MagicMock()

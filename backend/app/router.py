@@ -20,22 +20,28 @@ from fastapi import APIRouter, HTTPException, Request
 from .cpp_bridge import CppBridgeError
 from .database import (
     batch_sync_crane_statuses,
+    cancel_unfinished_jobs_for_run,
     check_connection,
+    close_simulation_run,
+    get_active_assignments_for_run,
     get_connection,
+    get_crane,
+    get_jobs_for_run,
     get_resource_inventory,
     get_simulation_job_id,
     insert_crane_assignment,
     insert_disruption_event,
     insert_simulation_job,
     insert_simulation_run,
-    release_active_crane_assignment_by_crane,
+    make_assigned_cranes_available,
+    release_active_assignments_for_run,
     release_active_crane_assignments_by_job,
+    release_crane_assignment,
     update_crane_status,
     update_job_status,
     update_job_work_progress,
-    upsert_crane,
 )
-from .execution import SimulationExecution
+from .execution import SimulationExecution, SimulationPersistenceError
 from .models import (
     CraneRegisterRequest,
     InitRequest,
@@ -71,6 +77,10 @@ def _get_execution(request: Request) -> SimulationExecution:
     if execution is None or execution.bridge is not bridge:
         execution = SimulationExecution(bridge)
         request.app.state.execution = execution
+    execution.on_snapshot = (
+        (lambda snap: _persist_snapshot(request, snap))
+        if getattr(request.app.state, "current_run_id", None) is not None else None
+    )
     return execution
 
 
@@ -103,71 +113,89 @@ def _get_db_pool(request: Request):
     return None
 
 
-def _sync_crane_statuses(bridge, request: Request) -> None:
-    """Take a C++ snapshot and persist all crane statuses to PostgreSQL.
-
-    This is the core of Bug 2's fix.  The C++ runtime is the authoritative
-    source for per-crane status (AVAILABLE / ASSIGNED / FAILED).  After any
-    operation that may change crane statuses (job submission that triggers
-    dispatch, or job completion that releases cranes) we snapshot the C++
-    registry and batch-update the ``cranes`` table so Database Inventory
-    reflects the real runtime state.
-
-    Design decisions:
-    - Only updates cranes that already exist in the DB (batch_sync skips
-      unknown IDs), so we never create phantom rows.
-    - Errors are caught and logged; they must NOT propagate back to the
-      caller since the primary C++ operation has already succeeded.
-    - If the snapshot itself fails (bridge error) we log a warning and
-      return without persisting — the next manual refresh will catch up.
-    """
+def _persist_snapshot(request: Request, snap: dict[str, Any]) -> dict[str, int]:
+    """Reconcile current-run jobs, cranes and assignments in one transaction."""
     pool = _get_db_pool(request)
+    run_id = getattr(request.app.state, "current_run_id", None)
+    if run_id is None:
+        return {"reconciled_cranes": 0, "reconciled_jobs": 0}
     if pool is None:
-        return  # No DB available — nothing to sync.
+        raise RuntimeError("Database unavailable; runtime snapshot was not persisted")
+    if not snap.get("ok") or not isinstance(snap.get("jobs"), list) or not isinstance(snap.get("cranes"), list):
+        raise RuntimeError("Cannot persist an invalid C++ snapshot")
 
-    # Only sync runtime crane status if a simulation run is active
+    jobs = {j["job_id"]: j for j in snap["jobs"]}
+    desired = {}
+    statuses = []
+    crane_states = {}
+    for crane in snap["cranes"]:
+        cid, status = crane["crane_id"], crane["status"]
+        if status not in ("AVAILABLE", "ASSIGNED", "FAILED"):
+            raise RuntimeError(f"Invalid crane status for {cid}")
+        statuses.append({"crane_id": cid, "status": status})
+        crane_states[cid] = status
+        if status == "ASSIGNED":
+            jid = crane.get("assigned_job")
+            if not jid or jid not in jobs or jobs[jid]["state"] != "ACTIVE":
+                raise RuntimeError(f"Invalid assignment in C++ snapshot for {cid}")
+            desired[cid] = jid
+
+    with get_connection(pool) as conn:
+        persisted_jobs = {j["job_id"]: j for j in get_jobs_for_run(conn, run_id)}
+        old = {a["crane_id"]: a for a in get_active_assignments_for_run(conn, run_id)}
+        # Release first to satisfy the partial unique index before replacements.
+        for cid, assignment in old.items():
+            if desired.get(cid) != assignment["job_id"]:
+                state = jobs.get(assignment["job_id"], {}).get("state")
+                reason = ("JOB_COMPLETED" if state == "COMPLETED" else
+                          "JOB_CANCELLED" if state == "CANCELLED" else
+                          "CRANE_FAILED" if crane_states.get(cid) == "FAILED" else
+                          "REASSIGNED")
+                release_crane_assignment(conn, assignment_id=assignment["assignment_id"],
+                                         release_reason=reason)
+        for cid, jid in desired.items():
+            if cid in old and old[cid]["job_id"] == jid:
+                continue
+            job = persisted_jobs.get(jid)
+            if job is None:
+                raise RuntimeError(f"Job {jid} is missing from run {run_id} in PostgreSQL")
+            insert_crane_assignment(conn, crane_id=cid,
+                                    simulation_job_id=job["simulation_job_id"])
+        for jid, job in jobs.items():
+            previous = persisted_jobs.get(jid)
+            if previous is None:
+                raise RuntimeError(f"Job {jid} is missing from run {run_id} in PostgreSQL")
+            state = job["state"]
+            if state != previous["status"]:
+                update_job_status(conn, run_id=run_id, job_id=jid, status=state)
+            completed, remaining = int(job["work_completed"]), int(job["work_remaining"])
+            completion_wrote_progress = state == "COMPLETED" and previous["status"] != "COMPLETED"
+            if not completion_wrote_progress and (
+                completed != previous["work_completed"] or remaining != previous["work_remaining"]
+            ):
+                update_job_work_progress(conn, run_id=run_id, job_id=jid,
+                                         work_completed=completed, work_remaining=remaining)
+        updated = 0
+        if statuses:
+            updated = batch_sync_crane_statuses(conn, statuses)
+            if updated != len(statuses):
+                raise RuntimeError("A runtime crane is missing from PostgreSQL inventory")
+    return {"reconciled_cranes": updated, "reconciled_jobs": len(jobs)}
+
+
+def _sync_crane_statuses(bridge, request: Request) -> None:
+    """Snapshot and persist jobs, crane statuses, and assignments."""
     if getattr(request.app.state, "current_run_id", None) is None:
         return
-
+    if _get_db_pool(request) is None:
+        raise HTTPException(status_code=503, detail="Database unavailable; runtime changed and reconciliation is required")
+    snap = _send(bridge, {"cmd": "snapshot"})
     try:
-        snap = bridge.send({"cmd": "snapshot"})
-    except Exception as exc:
-        logger.warning("Could not take snapshot for crane status sync: %s", exc)
-        return
-
-    if not snap.get("ok", False):
-        logger.warning(
-            "Snapshot returned ok=false during crane status sync: %s",
-            snap.get("error", ""),
-        )
-        return
-
-    cranes_list = snap.get("cranes", [])
-    if not cranes_list:
-        return
-
-    # Build a list of {crane_id, status} dicts from the snapshot.
-    crane_statuses = []
-    for c in cranes_list:
-        cid = c.get("crane_id", "")
-        status = c.get("status", "")
-        if cid and status in ("AVAILABLE", "ASSIGNED", "FAILED"):
-            crane_statuses.append({"crane_id": cid, "status": status})
-
-    if not crane_statuses:
-        return
-
-    try:
-        with get_connection(pool) as conn:
-            updated = batch_sync_crane_statuses(conn, crane_statuses)
-        logger.info(
-            "Synced crane statuses from C++ snapshot: %d/%d rows updated",
-            updated,
-            len(crane_statuses),
-        )
-    except Exception as exc:
-        logger.warning("DB write failed during crane status sync: %s", exc)
-
+        _persist_snapshot(request, snap)
+    except Exception:
+        logger.exception("Could not synchronize C++ snapshot to PostgreSQL")
+        raise HTTPException(status_code=503,
+                            detail="Database synchronization failed; runtime changed and reconciliation is required")
 
 # ─── Endpoints ────────────────────────────────────────────────────────────────
 
@@ -209,125 +237,122 @@ def health(request: Request):
 
 @router.post("/simulation/init")
 async def simulation_init(body: InitRequest, request: Request):
-    """Initialise the PortDispatcher with capacities and policy."""
+    """Close the prior run before replacing its in-memory dispatcher."""
     bridge = _get_bridge(request)
+    execution = _get_execution(request)
     cmd: dict[str, Any] = {
-        "cmd": "init",
-        "berths": body.berths,
-        "cranes": body.cranes,
+        "cmd": "init", "berths": body.berths, "cranes": body.cranes,
         "trucks": body.trucks,
     }
     if body.policy is not None:
         cmd["policy"] = body.policy.value
     if body.batch_mode is not None:
         cmd["batch_mode"] = body.batch_mode
-    try:
-        resp = await _get_execution(request).reset(cmd)
-    except CppBridgeError:
-        raise HTTPException(status_code=503, detail="C++ simulation bridge is unavailable")
-    except RuntimeError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
 
-    # ── Persist simulation run ────────────────────────────────────────────
-    # Always reset current_run_id before attempting persistence so a failed
-    # run never inherits a stale ID from a previous initialization.
-    request.app.state.current_run_id = None
+    previous_run_id = getattr(request.app.state, "current_run_id", None)
     pool = _get_db_pool(request)
-    if pool is not None:
-        confirmed_policy = resp.get("policy", "FCFS")
+    if previous_run_id is not None and pool is None:
+        raise HTTPException(status_code=503, detail="Database unavailable; active simulation was not reset")
+    new_run_id = None
+
+    def prepare_reset(snapshot):
+        nonlocal new_run_id, previous_run_id
+        previous_run_id = getattr(request.app.state, "current_run_id", None)
+        if pool is None:
+            if previous_run_id is not None:
+                raise RuntimeError("Database unavailable; active simulation was not reset")
+            return
+        if previous_run_id is not None and snapshot is None:
+            raise RuntimeError("Previous simulation snapshot is unavailable")
         now = datetime.now(timezone.utc)
         run_name = f"Run {now.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3]}Z"
-        try:
-            with get_connection(pool) as conn:
-                run_id = insert_simulation_run(
-                    conn,
-                    run_name=run_name,
-                    scheduling_policy=confirmed_policy,
-                    total_berths=body.berths,
-                    total_cranes=body.cranes,
-                    total_trucks=body.trucks,
-                )
-            request.app.state.current_run_id = run_id
-            logger.info("Created simulation run %d (%s)", run_id, run_name)
-        except Exception as exc:
+        # Commit reconciliation before the destructive C++ init. A DB failure
+        # therefore leaves the previous runtime intact.
+        with get_connection(pool) as conn:
+            if previous_run_id is not None:
+                assignments = get_active_assignments_for_run(conn, previous_run_id)
+                assigned_ids = {c["crane_id"] for c in snapshot["cranes"]
+                                if c["status"] == "ASSIGNED"}
+                assigned_ids.update(a["crane_id"] for a in assignments)
+                failed_ids = {c["crane_id"] for c in snapshot["cranes"]
+                              if c["status"] == "FAILED"}
+                assigned_ids.difference_update(failed_ids)
+                cancel_unfinished_jobs_for_run(conn, previous_run_id)
+                release_active_assignments_for_run(conn, previous_run_id, "SIMULATION_RESET")
+                make_assigned_cranes_available(conn, sorted(assigned_ids))
+                if failed_ids:
+                    failed_statuses = [{"crane_id": cid, "status": "FAILED"}
+                                       for cid in sorted(failed_ids)]
+                    if batch_sync_crane_statuses(conn, failed_statuses) != len(failed_statuses):
+                        raise RuntimeError("A failed runtime crane is missing from inventory")
+                terminal = ("COMPLETED" if snapshot["jobs"] and all(
+                    job["state"] in ("COMPLETED", "CANCELLED")
+                    for job in snapshot["jobs"]) else "FAILED")
+                close_simulation_run(conn, previous_run_id, terminal)
+            candidate_run_id = insert_simulation_run(
+                conn, run_name=run_name,
+                scheduling_policy=body.policy.value if body.policy else "FCFS",
+                total_berths=body.berths, total_cranes=body.cranes,
+                total_trucks=body.trucks,
+            )
+        new_run_id = candidate_run_id
+
+    try:
+        resp = await execution.reset(cmd, before_reset=prepare_reset,
+                                     capture_snapshot=lambda: getattr(
+                                         request.app.state, "current_run_id", None) is not None)
+    except Exception as exc:
+        # If DB reconciliation failed, C++ init was never sent. If C++ init
+        # failed after commit, the new DB run is closed as a failed attempt.
+        if new_run_id is not None:
+            try:
+                with get_connection(pool) as conn:
+                    close_simulation_run(conn, new_run_id)
+            except Exception:
+                logger.exception("Could not close failed initialization run %s", new_run_id)
             request.app.state.current_run_id = None
-            logger.warning("DB write failed for simulation init: %s", exc)
-    else:
-        logger.warning(
-            "No database pool available; skipping simulation run persistence"
-        )
-
+            # The old run is already closed in PostgreSQL. Prevent further
+            # commands against a possibly still-live old dispatcher.
+            request.app.state.bridge = None
+        cpp_rejected = isinstance(exc, RuntimeError) and (new_run_id is not None or pool is None)
+        detail = (f"Simulation initialization failed: {exc}" if cpp_rejected else
+                  "C++ initialization failed after database prepare; restart the backend"
+                  if new_run_id is not None else
+                  "Simulation initialization failed before C++ reset; previous runtime is intact")
+        raise HTTPException(status_code=400 if cpp_rejected else 503, detail=detail)
+    request.app.state.current_run_id = new_run_id
     return resp
-
 
 @router.post("/simulation/cranes")
 def simulation_register_crane(body: CraneRegisterRequest, request: Request):
-    """Register a crane with the C++ dispatcher.
-
-    Idempotent: if the crane is already registered in the current C++ session
-    (i.e. C++ returns a duplicate-crane error), the handler still upserts the
-    crane record in PostgreSQL and returns HTTP 200.  This prevents stale DB
-    entries when a crane was registered in a previous session but the C++
-    process was restarted without clearing the database.
-    """
+    """Register only an existing AVAILABLE physical crane."""
     bridge = _get_bridge(request)
     crane_id = body.crane_id.strip()
-    cmd: dict[str, Any] = {
-        "cmd": "register_crane",
-        "crane_id": crane_id,
-    }
+    if not crane_id:
+        raise HTTPException(status_code=400, detail="crane_id must not be empty")
+    pool = _get_db_pool(request)
+    if pool is None:
+        raise HTTPException(status_code=503, detail="Database inventory unavailable")
+    try:
+        with get_connection(pool) as conn:
+            crane = get_crane(conn, crane_id)
+    except Exception:
+        logger.exception("Could not validate crane inventory")
+        raise HTTPException(status_code=503, detail="Database inventory unavailable")
+    if crane is None:
+        raise HTTPException(status_code=404, detail=f"Crane '{crane_id}' is not in PostgreSQL inventory")
+    if crane["status"] != "AVAILABLE":
+        raise HTTPException(status_code=409, detail=f"Crane '{crane_id}' is {crane['status']}")
 
     try:
-        resp = bridge.send(cmd)
+        resp = bridge.send({"cmd": "register_crane", "crane_id": crane_id})
     except CppBridgeError:
-        raise HTTPException(
-            status_code=503,
-            detail="C++ simulation bridge is unavailable",
-        )
-
-    # Bug 1 fix: C++ CraneRegistry rejects re-registration of an already-known
-    # crane with "Duplicate crane ID: ...".  From the API perspective this is
-    # idempotent — the crane is already AVAILABLE in the runtime and the DB
-    # ON CONFLICT clause will simply update updated_at.  We persist and return
-    # 200 so callers do not have to distinguish "registered now" vs "already
-    # registered" and the DB row is always kept in sync.
-    is_duplicate = (
-        not resp.get("ok", False)
-        and "duplicate crane" in resp.get("error", "").lower()
-    )
-
-    if not resp.get("ok", False) and not is_duplicate:
-        # Genuine C++ rejection (not a duplicate) — propagate as 400.
-        raise HTTPException(
-            status_code=400,
-            detail=resp.get("error", "C++ command rejected"),
-        )
-
-    # ── Persist crane registration (new or duplicate) ──────────────────────
-    pool = _get_db_pool(request)
-    if pool is not None:
-        try:
-            with get_connection(pool) as conn:
-                upsert_crane(
-                    conn,
-                    crane_id=crane_id,
-                    terminal_id=1,
-                    status="AVAILABLE",
-                )
-            logger.info("Persisted crane %s (duplicate=%s)", crane_id, is_duplicate)
-        except Exception as exc:
-            logger.warning("DB write failed for crane %s: %s", crane_id, exc)
-    else:
-        logger.warning(
-            "No database pool available; skipping crane persistence"
-        )
-
-    # Return a normalised ok response for duplicates so the frontend treats
-    # re-registration as a success.
-    if is_duplicate:
-        return {"ok": True, "crane_id": crane_id}
+        raise HTTPException(status_code=503, detail="C++ simulation bridge is unavailable")
+    if not resp.get("ok", False):
+        error = resp.get("error", "C++ command rejected")
+        code = 409 if "duplicate crane" in error.lower() else 400
+        raise HTTPException(status_code=code, detail=error)
     return resp
-
 
 @router.post("/simulation/jobs")
 def simulation_submit_job(body: JobSubmitRequest, request: Request):
@@ -462,6 +487,8 @@ async def simulation_step(request: Request):
     execution = _get_execution(request)
     try:
         response = await execution.step(continue_batch=False)
+    except SimulationPersistenceError as exc:
+        raise HTTPException(status_code=503, detail=f"Step completed in C++; database reconciliation required: {exc}")
     except CppBridgeError:
         raise HTTPException(status_code=503, detail="C++ simulation bridge is unavailable")
     except RuntimeError as exc:
@@ -646,11 +673,6 @@ def _simulation_crane_fail_sync(crane_id: str, request: Request):
                         work_remaining=work_remaining if affected_job_id else None,
                     )
 
-                # Release any active assignment record for this crane.
-                release_active_crane_assignment_by_crane(
-                    conn, crane_id=crane_id, release_reason="CRANE_FAILED"
-                )
-
                 # Update job status and work progress if interrupted.
                 if affected_job_id and job_interrupted and run_id is not None:
                     update_job_status(
@@ -768,22 +790,7 @@ def _simulation_crane_recover_sync(crane_id: str, request: Request):
                         crane_id=crane_id,
                         event_type="CRANE_RECOVERED",
                     )
-                    if dispatched_job_id:
-                        sim_job_id = get_simulation_job_id(
-                            conn, run_id=run_id, job_id=dispatched_job_id
-                        )
-                        if sim_job_id is not None:
-                            insert_crane_assignment(
-                                conn,
-                                crane_id=crane_id,
-                                simulation_job_id=sim_job_id,
-                            )
-                        update_job_status(
-                            conn,
-                            run_id=run_id,
-                            job_id=dispatched_job_id,
-                            status="ACTIVE",
-                        )
+                    # Snapshot reconciliation records any resumption assignment.
 
             logger.info("Persisted crane %s recovery", crane_id)
         except Exception as exc:
@@ -813,70 +820,17 @@ def _simulation_crane_recover_sync(crane_id: str, request: Request):
 
 @router.post("/simulation/reconcile")
 def simulation_reconcile(request: Request):
-    """Reconcile PostgreSQL state with the authoritative C++ runtime snapshot.
-
-    Compares runtime crane statuses and active/interrupted jobs with PostgreSQL,
-    repairing any discrepancies caused by transient database write failures
-    without duplicating events or resource releases.
-    """
+    """Repair job, crane and assignment rows from the current C++ snapshot."""
     bridge = _get_bridge(request)
-    pool = _get_db_pool(request)
-    if pool is None:
+    if _get_db_pool(request) is None:
         raise HTTPException(status_code=503, detail="Database unavailable")
-
+    snap = _send(bridge, {"cmd": "snapshot"})
     try:
-        snap = bridge.send({"cmd": "snapshot"})
-    except CppBridgeError:
-        raise HTTPException(
-            status_code=503,
-            detail="C++ simulation bridge is unavailable",
-        )
-    if not snap.get("ok", False):
-        raise HTTPException(
-            status_code=400,
-            detail=snap.get("error", "snapshot failed"),
-        )
-
-    run_id = getattr(request.app.state, "current_run_id", None)
-    cranes_list = snap.get("cranes", [])
-    jobs_list = snap.get("jobs", [])
-
-    crane_statuses = []
-    for c in cranes_list:
-        cid = c.get("crane_id", "")
-        status = c.get("status", "")
-        if cid and status in ("AVAILABLE", "ASSIGNED", "FAILED"):
-            crane_statuses.append({"crane_id": cid, "status": status})
-
-    reconciled_cranes = 0
-    reconciled_jobs = 0
-    with get_connection(pool) as conn:
-        if crane_statuses:
-            reconciled_cranes = batch_sync_crane_statuses(conn, crane_statuses)
-
-        if run_id is not None:
-            for j in jobs_list:
-                jid = j.get("job_id", "")
-                jstate = j.get("state", "")
-                wc = int(j.get("work_completed", 0))
-                wr = int(j.get("work_remaining", 0))
-                if jstate in ("INTERRUPTED", "ACTIVE", "COMPLETED", "CANCELLED"):
-                    update_job_status(conn, run_id=run_id, job_id=jid, status=jstate)
-                    update_job_work_progress(
-                        conn,
-                        run_id=run_id,
-                        job_id=jid,
-                        work_completed=wc,
-                        work_remaining=wr,
-                    )
-                    reconciled_jobs += 1
-
-    return {
-        "ok": True,
-        "reconciled_cranes": reconciled_cranes,
-        "reconciled_jobs": reconciled_jobs,
-    }
-
+        counts = _persist_snapshot(request, snap)
+    except Exception:
+        logger.exception("Database reconciliation failed")
+        raise HTTPException(status_code=503, detail="Database reconciliation failed")
+    return {"ok": True, **counts}
 
 @router.get("/inventory")
 def get_inventory(request: Request):

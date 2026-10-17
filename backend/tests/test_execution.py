@@ -6,6 +6,7 @@ import os
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from fastapi import FastAPI
@@ -185,6 +186,75 @@ def test_runner_error_and_reinitialization_stops_execution():
         assert bridge.jobs == []
 
 
+def test_runner_snapshots_include_automatic_dispatch_and_completion():
+    bridge = WorkBridge(work=(1, 1))
+    with client_for(bridge) as client:
+        client.app.state.db_pool = SimpleNamespace(is_open=True)
+        client.app.state.current_run_id = 7
+        captured = []
+        with patch("backend.app.router._persist_snapshot", side_effect=lambda request, snap: captured.append(snap)):
+            assert client.post("/simulation/run", json={"interval_seconds": 0.05}).status_code == 200
+            wait_for(client, "completed")
+        assert any(any(j["job_id"] == "J1" and j["state"] == "ACTIVE"
+                       for j in snap["jobs"]) for snap in captured)
+        assert any(all(j["state"] == "COMPLETED" for j in snap["jobs"])
+                   for snap in captured)
+
+
+def test_manual_step_persists_its_snapshot():
+    bridge = WorkBridge(work=(2,))
+    with client_for(bridge) as client:
+        client.app.state.db_pool = SimpleNamespace(is_open=True)
+        client.app.state.current_run_id = 7
+        with patch("backend.app.router._persist_snapshot") as persist:
+            assert client.post("/simulation/step").status_code == 200
+        persist.assert_called_once()
+        assert persist.call_args.args[1]["jobs"][0]["work_completed"] == 1
+
+
+def test_manual_step_reports_database_persistence_failure():
+    bridge = WorkBridge(work=(2,))
+    with client_for(bridge) as client:
+        client.app.state.current_run_id = 7
+        response = client.post("/simulation/step")
+        assert response.status_code == 503
+        assert "reconciliation required" in response.json()["detail"]
+        assert bridge.jobs[0]["work_completed"] == 1
+
+
+def test_runner_blocks_when_database_persistence_fails():
+    bridge = WorkBridge(work=(4,))
+    with client_for(bridge) as client:
+        client.app.state.current_run_id = 7
+        assert client.post("/simulation/run", json={"interval_seconds": 0.05}).status_code == 200
+        status = wait_for(client, "blocked")
+        assert "Database unavailable" in status["error"]
+        assert bridge.jobs[0]["work_completed"] == 1
+
+
+def test_reset_waits_for_active_runner_before_database_reconciliation():
+    bridge = WorkBridge(work=(20,))
+    with client_for(bridge) as client:
+        client.app.state.db_pool = SimpleNamespace(is_open=True)
+        client.app.state.current_run_id = 7
+        with patch("backend.app.router._persist_snapshot"), \
+             patch("backend.app.router.get_connection") as connection, \
+             patch("backend.app.router.get_active_assignments_for_run", return_value=[]), \
+             patch("backend.app.router.cancel_unfinished_jobs_for_run") as cancel, \
+             patch("backend.app.router.release_active_assignments_for_run"), \
+             patch("backend.app.router.make_assigned_cranes_available"), \
+             patch("backend.app.router.close_simulation_run"), \
+             patch("backend.app.router.insert_simulation_run", return_value=8):
+            assert client.post("/simulation/run", json={"interval_seconds": 0.05}).status_code == 200
+            wait_for_work(bridge)
+            assert client.post("/simulation/init", json={
+                "berths": 1, "cranes": 1, "trucks": 0,
+            }).status_code == 200
+            cancel.assert_called_once_with(connection.return_value.__enter__.return_value, 7)
+            assert bridge.jobs == []
+            assert client.app.state.current_run_id == 8
+
+
 def test_actual_cpp_bridge_step_and_run():
     if os.name != "nt":
         pytest.skip("Windows C++ executable integration test")
@@ -198,7 +268,12 @@ def test_actual_cpp_bridge_step_and_run():
             assert client.post("/simulation/init", json={
                 "berths": 1, "cranes": 1, "trucks": 1, "batch_mode": True
             }).status_code == 200
-            assert client.post("/simulation/cranes", json={"crane_id": "C1"}).status_code == 200
+            client.app.state.db_pool = SimpleNamespace(is_open=True)
+            with patch("backend.app.router.get_connection") as connection, \
+                 patch("backend.app.router.get_crane", return_value={"crane_id": "C1", "status": "AVAILABLE"}):
+                connection.return_value.__enter__.return_value = object()
+                assert client.post("/simulation/cranes", json={"crane_id": "C1"}).status_code == 200
+            client.app.state.db_pool = None
             assert client.post("/simulation/jobs", json={
                 "job_id": "J1", "arrival_time": 0, "work_total": 2,
                 "priority": 1, "berths": 1, "cranes": 1, "trucks": 1,

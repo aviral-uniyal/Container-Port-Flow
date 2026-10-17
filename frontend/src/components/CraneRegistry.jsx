@@ -15,6 +15,7 @@ import { useState } from 'react'
  */
 export default function CraneRegistry({
   cranes = [],
+  inventory,
   onRegister,
   onFail,
   onRecover,
@@ -24,6 +25,11 @@ export default function CraneRegistry({
   lastFailResult,
 }) {
   const [craneId, setCraneId] = useState('')
+  const registeredIds = new Set(cranes.map(crane => crane.crane_id))
+  const eligible = (inventory?.cranes ?? []).filter(
+    crane => crane.status === 'AVAILABLE' && !registeredIds.has(crane.crane_id)
+  )
+  const selectedCraneId = eligible.some(crane => crane.crane_id === craneId) ? craneId : ''
 
   const STATUS_BADGE = {
     AVAILABLE: 'badge badge--available',
@@ -33,9 +39,8 @@ export default function CraneRegistry({
 
   function handleSubmit(e) {
     e.preventDefault()
-    const trimmed = craneId.trim()
-    if (trimmed && onRegister) {
-      onRegister(trimmed)
+    if (selectedCraneId && onRegister) {
+      onRegister(selectedCraneId)
       setCraneId('')
     }
   }
@@ -53,26 +58,34 @@ export default function CraneRegistry({
                 style={{ flexDirection: 'row', alignItems: 'flex-end', gap: 'var(--space-3)' }}>
             <div className="field" style={{ flex: 1 }}>
               <label className="field__label" htmlFor="crane-id-input">Crane ID</label>
-              <input
+              <select
                 id="crane-id-input"
-                type="text"
                 className="field__input"
-                value={craneId}
+                value={selectedCraneId}
                 onChange={e => setCraneId(e.target.value)}
-                placeholder="e.g. CRANE-01"
                 required
-                minLength={1}
-              />
+                disabled={eligible.length === 0}
+              >
+                <option value="">Select an available crane</option>
+                {eligible.map(crane => (
+                  <option key={crane.crane_id} value={crane.crane_id}>{crane.crane_id}</option>
+                ))}
+              </select>
             </div>
             <button
               id="btn-register-crane"
               type="submit"
               className="btn btn--primary btn--sm"
-              disabled={disabled || !craneId.trim()}
+              disabled={disabled || !selectedCraneId}
             >
               {disabled ? 'Registering…' : 'Register Crane'}
             </button>
           </form>
+          {eligible.length === 0 && (
+            <p style={{ color: 'var(--clr-text-muted)', fontSize: 'var(--text-sm)' }}>
+              No eligible database cranes are available to register.
+            </p>
+          )}
         </div>
       )}
 

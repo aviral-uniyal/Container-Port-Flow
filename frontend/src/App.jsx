@@ -536,6 +536,7 @@ export default function App() {
         {/* Crane Registry — full width */}
         <CraneRegistry
           cranes={cranes}
+          inventory={inventory}
           onRegister={handleCraneRegister}
           onFail={handleCraneFail}
           onRecover={handleCraneRecover}

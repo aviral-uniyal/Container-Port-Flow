@@ -237,7 +237,8 @@ def batch_sync_crane_statuses(
     already exist in the database are updated — unknown IDs are silently
     skipped (they may not have been registered in the DB yet).
 
-    Returns the number of rows actually updated.
+    Returns the number of existing crane rows matched. Unchanged statuses
+    retain their original updated_at timestamp.
 
     This is used to persist runtime state (ASSIGNED / AVAILABLE transitions)
     from the C++ snapshot into PostgreSQL so that Database Inventory reflects
@@ -245,7 +246,7 @@ def batch_sync_crane_statuses(
     """
     if not crane_statuses:
         return 0
-    updated = 0
+    matched = 0
     sql = """
         UPDATE cranes
            SET status     = %(status)s,
@@ -254,9 +255,27 @@ def batch_sync_crane_statuses(
     """
     with conn.cursor() as cur:
         for entry in crane_statuses:
-            cur.execute(sql, {"crane_id": entry["crane_id"], "status": entry["status"]})
-            updated += cur.rowcount
-    return updated
+            cur.execute("SELECT status FROM cranes WHERE crane_id = %(crane_id)s FOR UPDATE",
+                        {"crane_id": entry["crane_id"]})
+            row = cur.fetchone()
+            if row is None:
+                continue
+            matched += 1
+            if row[0] != entry["status"]:
+                cur.execute(sql, {"crane_id": entry["crane_id"], "status": entry["status"]})
+    return matched
+
+
+def make_assigned_cranes_available(conn, crane_ids: list[str]) -> int:
+    """Clear only selected ASSIGNED inventory rows; never recover FAILED cranes."""
+    if not crane_ids:
+        return 0
+    with conn.cursor() as cur:
+        cur.execute("""
+            UPDATE cranes SET status = 'AVAILABLE', updated_at = now()
+             WHERE crane_id = ANY(%(crane_ids)s) AND status = 'ASSIGNED'
+        """, {"crane_ids": crane_ids})
+        return cur.rowcount
 
 
 # ── 2. Simulation Runs ────────────────────────────────────────────────────────
@@ -310,6 +329,29 @@ def get_simulation_run(conn, run_id: int) -> dict[str, Any] | None:
         cur.execute(sql, {"run_id": run_id})
         row = cur.fetchone()
         return dict(row) if row else None
+
+
+def close_simulation_run(conn, run_id: int, status: str = "FAILED") -> bool:
+    """Close a run without changing an already closed run."""
+    if status not in ("FAILED", "COMPLETED"):
+        raise ValueError("Invalid terminal simulation run status")
+    with conn.cursor() as cur:
+        cur.execute("""
+            UPDATE simulation_runs SET status = %(status)s, ended_at = now()
+             WHERE run_id = %(run_id)s AND status = 'RUNNING'
+        """, {"run_id": run_id, "status": status})
+        return cur.rowcount > 0
+
+
+def cancel_unfinished_jobs_for_run(conn, run_id: int) -> int:
+    """Retain completed history and cancel only unfinished jobs in one run."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            UPDATE simulation_jobs SET status = 'CANCELLED', completed_at = now()
+             WHERE run_id = %(run_id)s
+               AND status IN ('PENDING', 'ACTIVE', 'INTERRUPTED')
+        """, {"run_id": run_id})
+        return cur.rowcount
 
 
 # ── 3. Simulation Jobs ────────────────────────────────────────────────────────
@@ -561,6 +603,31 @@ def release_active_crane_assignments_by_job(
             "release_reason": release_reason,
         })
         return getattr(cur, "rowcount", 0)
+
+
+def get_active_assignments_for_run(conn, run_id: int) -> list[dict[str, Any]]:
+    """Return active assignments belonging to exactly one simulation run."""
+    with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+        cur.execute("""
+            SELECT a.assignment_id, a.crane_id, a.simulation_job_id, j.job_id
+              FROM crane_assignments a
+              JOIN simulation_jobs j ON j.simulation_job_id = a.simulation_job_id
+             WHERE j.run_id = %(run_id)s AND a.released_at IS NULL
+        """, {"run_id": run_id})
+        return [dict(row) for row in cur.fetchall()]
+
+
+def release_active_assignments_for_run(conn, run_id: int, reason: str) -> int:
+    """Close assignment history for one run; repeated calls are harmless."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            UPDATE crane_assignments a
+               SET released_at = now(), release_reason = %(reason)s
+              FROM simulation_jobs j
+             WHERE a.simulation_job_id = j.simulation_job_id
+               AND j.run_id = %(run_id)s AND a.released_at IS NULL
+        """, {"run_id": run_id, "reason": reason})
+        return cur.rowcount
 
 
 # ── 5. Disruption Events ──────────────────────────────────────────────────────
