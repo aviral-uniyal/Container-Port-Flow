@@ -17,6 +17,7 @@ import {
   failCrane,
   recoverCrane,
   reconcileState,
+  dispatchBatch,
 } from './api'
 
 /**
@@ -43,6 +44,9 @@ export default function App() {
   const [inventoryLoading, setInventoryLoading] = useState(false)
   const [inventoryError,   setInventoryError]   = useState(null)
   const [lastFailResult,   setLastFailResult]   = useState(null)
+  // batchMode mirrors the C++ dispatcher's batch_mode flag set during init.
+  // When true the dashboard shows the "Dispatch All" button.
+  const [batchMode,        setBatchMode]        = useState(false)
 
   /* ── Helper: set loading flag for a given action key ── */
   function setBusy(key, busy) {
@@ -137,11 +141,37 @@ export default function App() {
       setFeedback({ message: `Init failed: ${result.error}`, severity: 'err' })
       return
     }
+    // Read batch_mode from the C++ response (authoritative source).
+    const isBatch = result.data.batch_mode === true
+    setBatchMode(isBatch)
     setFeedback({
-      message: `Simulation initialized — policy: ${result.data.policy || 'FCFS'}.`,
+      message: `Simulation initialized — policy: ${result.data.policy || 'FCFS'}${
+        isBatch ? ' · Batch mode ON — click “Dispatch All” to send queued jobs.' : ''
+      }.`,
       severity: 'ok',
     })
     setLastFailResult(null)
+    await refreshSnapshot()
+    await refreshInventory()
+  }
+
+  /* ── Dispatch all queued jobs (batch mode only) ── */
+  async function handleDispatch() {
+    setBusy('dispatch', true)
+    const result = await dispatchBatch()
+    setBusy('dispatch', false)
+    if (!result.ok) {
+      setFeedback({ message: `Dispatch failed: ${result.error}`, severity: 'err' })
+      return
+    }
+    const count = result.data.count ?? 0
+    const ids   = (result.data.dispatched_jobs ?? []).join(', ')
+    setFeedback({
+      message: count > 0
+        ? `Dispatched ${count} job${count !== 1 ? 's' : ''}: ${ids}.`
+        : 'Dispatch All ran — no eligible jobs were waiting.',
+      severity: count > 0 ? 'ok' : 'warn',
+    })
     await refreshSnapshot()
     await refreshInventory()
   }
@@ -330,7 +360,13 @@ export default function App() {
         </div>
 
         {/* Jobs Table — full width */}
-        <JobsTable jobs={jobs} onComplete={handleJobComplete} loading={loading} />
+        <JobsTable
+          jobs={jobs}
+          onComplete={handleJobComplete}
+          onDispatch={handleDispatch}
+          batchMode={batchMode}
+          loading={loading}
+        />
 
         {/* Crane Registry — full width */}
         <CraneRegistry

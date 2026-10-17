@@ -190,3 +190,19 @@ export async function reconcileState() {
     return { ok: false, error: 'API unreachable' }
   }
 }
+
+/**
+ * POST /simulation/dispatch — flush the pending job queue using the active
+ * scheduling policy.  Only meaningful in batch mode.  Returns
+ * { ok, count, dispatched_jobs: [...] }.
+ */
+export async function dispatchBatch() {
+  try {
+    const res = await fetch('/simulation/dispatch', {
+      method: 'POST',
+    })
+    return handleResponse(res)
+  } catch {
+    return { ok: false, error: 'API unreachable' }
+  }
+}

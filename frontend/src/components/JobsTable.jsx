@@ -1,18 +1,22 @@
 /**
  * JobsTable — shows submitted simulation jobs.
- * Columns: job ID, state, work completed, work remaining, actions.
+ * Columns: job ID, state, work completed, work remaining, priority, actions.
  *
  * Props:
- *   jobs — array of job objects. Empty array shows an empty-state row.
+ *   jobs       — array of job objects. Empty array shows an empty-state row.
  *   onComplete — callback(job_id) for the Complete action button.
+ *   onDispatch — callback() for the Dispatch All button (batch mode only).
+ *   batchMode  — boolean; when true shows the Dispatch All banner.
+ *   loading    — object tracking in-flight request keys.
  */
-export default function JobsTable({ jobs = [], onComplete, loading = {} }) {
+export default function JobsTable({ jobs = [], onComplete, onDispatch, batchMode = false, loading = {} }) {
   const STATE_BADGE = {
-    PENDING:   'badge badge--pending',
-    ACTIVE:    'badge badge--active',
-    COMPLETED: 'badge badge--completed',
-    CANCELLED: 'badge badge--failed',
-    FAILED:    'badge badge--failed',
+    PENDING:     'badge badge--pending',
+    ACTIVE:      'badge badge--active',
+    COMPLETED:   'badge badge--completed',
+    INTERRUPTED: 'badge badge--failed',
+    CANCELLED:   'badge badge--failed',
+    FAILED:      'badge badge--failed',
   }
 
   // Keep running work separate from the dispatch queue, then show queued jobs
@@ -45,6 +49,29 @@ export default function JobsTable({ jobs = [], onComplete, loading = {} }) {
     <section className="card" aria-labelledby="jobs-table-title">
       <div className="card__header">
         <h2 className="card__title" id="jobs-table-title">Simulation Jobs</h2>
+
+        {/* Dispatch All banner — only visible in batch mode */}
+        {batchMode && (
+          <div className="batch-banner" role="status">
+            <span className="batch-banner__text">
+              ⏸ Batch mode
+              {jobs.some(j => j.state === 'PENDING') && (
+                <span className="batch-banner__count">
+                  {jobs.filter(j => j.state === 'PENDING').length} pending
+                </span>
+              )}
+            </span>
+            <button
+              id="btn-dispatch-all"
+              className="btn btn--primary btn--sm"
+              onClick={onDispatch}
+              disabled={loading.dispatch}
+              title="Dispatch all queued jobs using the active scheduling policy"
+            >
+              {loading.dispatch ? 'Dispatching…' : '▶▶ Dispatch All'}
+            </button>
+          </div>
+        )}
       </div>
       <div className="table-wrapper">
         <table className="table" aria-label="Simulation jobs list">
@@ -115,6 +142,14 @@ export default function JobsTable({ jobs = [], onComplete, loading = {} }) {
                         </div>
                       )
                     })()}
+                    {job.state === 'PENDING' && batchMode && (
+                      <span
+                        className="badge batch-pending-hint"
+                        title="Queued in batch mode — click Dispatch All to send"
+                      >
+                        awaiting dispatch
+                      </span>
+                    )}
                   </td>
                 </tr>
               ))

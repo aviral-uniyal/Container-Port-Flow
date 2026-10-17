@@ -4,23 +4,28 @@ const POLICIES = ['FCFS', 'SJF', 'PRIORITY']
 
 /**
  * SimulationSetup — form for initialising the port dispatcher.
- * Fields: berths, cranes, trucks, and scheduling policy.
+ * Fields: berths, cranes, trucks, scheduling policy, and batch mode.
  * Calls props.onSubmit(formData) when the form is submitted.
- * API integration is NOT implemented in this milestone.
+ *
+ * batch_mode (default false): when true, submitted jobs stay PENDING until the
+ * user explicitly clicks "Dispatch All".  Immediate dispatch is the default.
  */
 export default function SimulationSetup({ onSubmit, disabled }) {
   const [form, setForm] = useState({
-    berths: 4,
-    cranes: 2,
-    trucks: 6,
-    policy: 'FCFS',
+    berths:     4,
+    cranes:     2,
+    trucks:     6,
+    policy:     'FCFS',
+    batch_mode: false,
   })
 
   function handleChange(e) {
-    const { name, value, type } = e.target
+    const { name, value, type, checked } = e.target
     setForm(prev => ({
       ...prev,
-      [name]: type === 'number' ? Number(value) : value,
+      [name]: type === 'checkbox' ? checked
+             : type === 'number'  ? Number(value)
+             : value,
     }))
   }
 
@@ -101,6 +106,26 @@ export default function SimulationSetup({ onSubmit, disabled }) {
                 ))}
               </select>
             </div>
+          </div>
+
+          {/* ── Batch mode toggle ── */}
+          <div className="field">
+            <label className="batch-toggle" htmlFor="setup-batch-mode">
+              <input
+                id="setup-batch-mode"
+                name="batch_mode"
+                type="checkbox"
+                className="batch-toggle__checkbox"
+                checked={form.batch_mode}
+                onChange={handleChange}
+              />
+              <span className="batch-toggle__label">Batch Mode</span>
+            </label>
+            <span className="batch-toggle__hint">
+              {form.batch_mode
+                ? '⏸ Jobs will stay PENDING — click Dispatch All when ready.'
+                : '▶ Immediate dispatch (default).'}
+            </span>
           </div>
 
           <div className="form__actions">
