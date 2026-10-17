@@ -20,6 +20,7 @@ from fastapi import FastAPI
 
 from .cpp_bridge import CppBridge, CppBridgeError
 from .database import DatabasePool
+from .execution import SimulationExecution
 from .router import router
 
 logger = logging.getLogger(__name__)
@@ -37,6 +38,7 @@ async def lifespan(app: FastAPI):
         # Bridge failed to start — store None so /health reports degraded.
         bridge = None  # type: ignore[assignment]
     app.state.bridge = bridge
+    app.state.execution = SimulationExecution(bridge)
 
     # ── Database pool ─────────────────────────────────────────────────────
     db_pool = DatabasePool()
@@ -50,6 +52,7 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        await app.state.execution.pause()
         # ── Shutdown ──────────────────────────────────────────────────────
         if db_pool is not None:
             try:

@@ -61,3 +61,8 @@ class JobSubmitRequest(BaseModel):
     berths: int = Field(..., ge=1, description="Berths required (≥ 1)")
     cranes: int = Field(..., ge=0, description="Cranes required (≥ 0)")
     trucks: int = Field(..., ge=0, description="Trucks required (≥ 0)")
+
+
+class RunRequest(BaseModel):
+    """Optional timing for POST /simulation/run."""
+    interval_seconds: float = Field(default=1.0, ge=0.05, le=60.0)

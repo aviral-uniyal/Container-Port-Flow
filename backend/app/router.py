@@ -10,6 +10,7 @@ and maps responses / errors to appropriate HTTP status codes.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timezone
 from typing import Any
@@ -34,10 +35,12 @@ from .database import (
     update_job_work_progress,
     upsert_crane,
 )
+from .execution import SimulationExecution
 from .models import (
     CraneRegisterRequest,
     InitRequest,
     JobSubmitRequest,
+    RunRequest,
 )
 
 logger = logging.getLogger(__name__)
@@ -60,6 +63,15 @@ def _get_bridge(request: Request):
             detail="C++ simulation bridge is unavailable",
         )
     return bridge
+
+
+def _get_execution(request: Request) -> SimulationExecution:
+    bridge = _get_bridge(request)
+    execution = getattr(request.app.state, "execution", None)
+    if execution is None or execution.bridge is not bridge:
+        execution = SimulationExecution(bridge)
+        request.app.state.execution = execution
+    return execution
 
 
 def _send(bridge, command: dict[str, Any]) -> dict[str, Any]:
@@ -196,7 +208,7 @@ def health(request: Request):
 
 
 @router.post("/simulation/init")
-def simulation_init(body: InitRequest, request: Request):
+async def simulation_init(body: InitRequest, request: Request):
     """Initialise the PortDispatcher with capacities and policy."""
     bridge = _get_bridge(request)
     cmd: dict[str, Any] = {
@@ -209,7 +221,12 @@ def simulation_init(body: InitRequest, request: Request):
         cmd["policy"] = body.policy.value
     if body.batch_mode is not None:
         cmd["batch_mode"] = body.batch_mode
-    resp = _send(bridge, cmd)
+    try:
+        resp = await _get_execution(request).reset(cmd)
+    except CppBridgeError:
+        raise HTTPException(status_code=503, detail="C++ simulation bridge is unavailable")
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
     # ── Persist simulation run ────────────────────────────────────────────
     # Always reset current_run_id before attempting persistence so a failed
@@ -433,6 +450,40 @@ def simulation_snapshot(request: Request):
     return _send(bridge, {"cmd": "snapshot"})
 
 
+@router.get("/simulation/execution")
+def simulation_execution_status(request: Request):
+    """Return the backend runner state."""
+    return {"ok": True, **_get_execution(request).status()}
+
+
+@router.post("/simulation/step")
+async def simulation_step(request: Request):
+    """Advance one simulated work unit without authorizing batch dispatch."""
+    execution = _get_execution(request)
+    try:
+        response = await execution.step(continue_batch=False)
+    except CppBridgeError:
+        raise HTTPException(status_code=503, detail="C++ simulation bridge is unavailable")
+    except RuntimeError as exc:
+        code = 409 if execution.state == "running" else 400
+        raise HTTPException(status_code=code, detail=str(exc))
+    return response
+
+
+@router.post("/simulation/run")
+async def simulation_run(request: Request, body: RunRequest | None = None):
+    """Start or resume the single automatic runner."""
+    execution = _get_execution(request)
+    interval = body.interval_seconds if body is not None else 1.0
+    return {"ok": True, **await execution.run(interval)}
+
+
+@router.post("/simulation/pause")
+async def simulation_pause(request: Request):
+    """Stop the runner after any in-flight C++ command completes."""
+    return {"ok": True, **await _get_execution(request).pause()}
+
+
 @router.post("/simulation/dispatch")
 def simulation_dispatch(request: Request):
     """Trigger batch dispatch of queued jobs according to the active policy."""
@@ -463,7 +514,13 @@ def simulation_dispatch(request: Request):
 
 
 @router.post("/simulation/cranes/{crane_id}/fail")
-def simulation_crane_fail(crane_id: str, request: Request):
+async def simulation_crane_fail(crane_id: str, request: Request):
+    execution = _get_execution(request)
+    async with execution.lock:
+        return await asyncio.to_thread(_simulation_crane_fail_sync, crane_id, request)
+
+
+def _simulation_crane_fail_sync(crane_id: str, request: Request):
     """Mark a crane as FAILED in the C++ runtime and persist to PostgreSQL.
 
     Handles both idle (AVAILABLE) and assigned (ASSIGNED) cranes:
@@ -661,7 +718,13 @@ def simulation_crane_fail(crane_id: str, request: Request):
 
 
 @router.post("/simulation/cranes/{crane_id}/recover")
-def simulation_crane_recover(crane_id: str, request: Request):
+async def simulation_crane_recover(crane_id: str, request: Request):
+    execution = _get_execution(request)
+    async with execution.lock:
+        return await asyncio.to_thread(_simulation_crane_recover_sync, crane_id, request)
+
+
+def _simulation_crane_recover_sync(crane_id: str, request: Request):
     """Recover a FAILED crane back to AVAILABLE.
 
     Sends ``crane_recovered`` to the C++ runtime, persists the status change
