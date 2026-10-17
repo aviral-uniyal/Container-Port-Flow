@@ -762,6 +762,34 @@ static bool test_no_fabricated_capacity() {
     return true;
 }
 
+// ─── Test 41: Lookup and available cranes consistency ─────────────────────────
+static bool test_lookup_and_available_cranes_consistency() {
+    CraneRegistry reg;
+    ASSERT_FALSE(reg.has_crane("CRANE-X"));
+    ASSERT_FALSE(reg.has_crane(""));
+
+    reg.register_crane("CRANE-1");
+    reg.register_crane("CRANE-2");
+
+    ASSERT_TRUE(reg.has_crane("CRANE-1"));
+    ASSERT_TRUE(reg.has_crane("CRANE-2"));
+    ASSERT_FALSE(reg.has_crane("CRANE-3"));
+
+    std::vector<std::string> avail = reg.available_cranes();
+    ASSERT_EQ(static_cast<int>(avail.size()), 2);
+
+    reg.assign_crane("CRANE-1", "JOB-101");
+    avail = reg.available_cranes();
+    ASSERT_EQ(static_cast<int>(avail.size()), 1);
+    ASSERT_EQ(avail[0], std::string("CRANE-2"));
+
+    reg.release_crane("CRANE-1");
+    avail = reg.available_cranes();
+    ASSERT_EQ(static_cast<int>(avail.size()), 2);
+
+    return true;
+}
+
 // =============================================================================
 // main
 // =============================================================================
@@ -824,6 +852,7 @@ int main() {
     run_test("RM/registry diverge on failure (documented)", test_rm_registry_divergence_on_failure);
     run_test("Double release rejected by both",           test_double_release_rejected);
     run_test("No fabricated capacity",                    test_no_fabricated_capacity);
+    run_test("Lookup and available cranes consistency",   test_lookup_and_available_cranes_consistency);
 
     std::cout << "\n─── Summary ────────────────────────\n";
     std::cout << "  Total:  " << g_total  << "\n";
