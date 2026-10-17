@@ -24,7 +24,7 @@ void CraneRegistry::register_crane(const std::string& crane_id) {
     if (crane_id.empty()) {
         throw std::invalid_argument("Crane ID must not be empty.");
     }
-    if (cranes_.count(crane_id) > 0) {
+    if (cranes_.find(crane_id) != cranes_.end()) {
         throw std::invalid_argument("Duplicate crane ID: " + crane_id);
     }
     cranes_[crane_id] = CraneState{crane_id, CraneStatus::AVAILABLE, ""};
@@ -33,7 +33,7 @@ void CraneRegistry::register_crane(const std::string& crane_id) {
 // ─── Queries ──────────────────────────────────────────────────────────────────
 
 bool CraneRegistry::has_crane(const std::string& crane_id) const {
-    return cranes_.count(crane_id) > 0;
+    return cranes_.find(crane_id) != cranes_.end();
 }
 
 CraneState CraneRegistry::get_crane(const std::string& crane_id) const {
@@ -51,6 +51,7 @@ std::vector<CraneState> CraneRegistry::all_cranes() const {
 
 std::vector<std::string> CraneRegistry::available_cranes() const {
     std::vector<std::string> result;
+    result.reserve(cranes_.size());
     for (const auto& kv : cranes_) {
         if (kv.second.status == CraneStatus::AVAILABLE) {
             result.push_back(kv.first);
