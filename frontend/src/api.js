@@ -35,6 +35,9 @@ async function handleResponse(res) {
     }
     // Standard FastAPI error
     const detail = body.detail || body.error || JSON.stringify(body)
+    if (detail && typeof detail === 'object' && !Array.isArray(detail)) {
+      return { ok: false, error: detail.message || JSON.stringify(detail), partial: detail }
+    }
     return { ok: false, error: detail }
   }
 

@@ -1,6 +1,7 @@
 """Focused, database-free tests for run-scoped inventory synchronization."""
 
 from contextlib import contextmanager
+import time
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -9,7 +10,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from backend.app.execution import SimulationExecution
-from backend.app.router import _persist_snapshot, router
+from backend.app.router import AssignmentConflictError, _persist_snapshot, router
 
 
 def snapshot(state, crane_status, job_id="J1", assigned_job=""):
@@ -35,6 +36,7 @@ class SnapshotStore:
         self.inserted = []
         self.released = []
         self.statuses = []
+        self.crane_status = {"C1": "AVAILABLE", "C2": "AVAILABLE"}
 
     @contextmanager
     def connection(self, pool):
@@ -42,15 +44,19 @@ class SnapshotStore:
 
     def assignments(self, conn, run_id):
         assert run_id == 7
-        return list(self.active)
+        return [a for a in self.active if a["run_id"] == run_id]
+
+    def assignments_for_cranes(self, conn, crane_ids):
+        return [a for a in self.active if a["crane_id"] in crane_ids]
 
     def insert(self, conn, crane_id, simulation_job_id):
-        assert crane_id == "C1"
+        assert crane_id in self.crane_status
         job_id = next(jid for jid, row in self.jobs.items()
                       if row["simulation_job_id"] == simulation_job_id)
         assignment_id = len(self.inserted) + 1
         row = {"assignment_id": assignment_id, "crane_id": crane_id,
-               "simulation_job_id": simulation_job_id, "job_id": job_id}
+               "simulation_job_id": simulation_job_id, "job_id": job_id,
+               "run_id": 7, "run_status": "RUNNING"}
         self.active.append(row)
         self.inserted.append(row)
         return assignment_id
@@ -75,6 +81,7 @@ class SnapshotStore:
 
     def sync_cranes(self, conn, statuses):
         self.statuses.append(statuses)
+        self.crane_status.update({entry["crane_id"]: entry["status"] for entry in statuses})
         return len(statuses)
 
 
@@ -85,6 +92,7 @@ def store():
         patch("backend.app.router.get_connection", side_effect=state.connection),
         patch("backend.app.router.get_jobs_for_run", side_effect=lambda conn, run_id: list(state.jobs.values())),
         patch("backend.app.router.get_active_assignments_for_run", side_effect=state.assignments),
+        patch("backend.app.router.get_active_assignments_for_cranes", side_effect=state.assignments_for_cranes),
         patch("backend.app.router.insert_crane_assignment", side_effect=state.insert),
         patch("backend.app.router.release_crane_assignment", side_effect=state.release),
         patch("backend.app.router.update_job_status", side_effect=state.update_status),
@@ -114,6 +122,37 @@ def test_new_dispatch_and_repeated_snapshot_are_idempotent(store):
     assert store.jobs["J1"]["status"] == "ACTIVE"
 
 
+def test_terminal_previous_run_assignment_is_closed_before_insert(store):
+    store.active.append({"assignment_id": 40, "crane_id": "C1",
+                         "simulation_job_id": 4, "job_id": "OLD",
+                         "run_id": 3, "run_status": "FAILED"})
+    active = snapshot("ACTIVE", "ASSIGNED", assigned_job="J1")
+    _persist_snapshot(request_for_run(), active)
+    _persist_snapshot(request_for_run(), active)
+    assert store.released == [(40, "STALE_ASSIGNMENT_RECONCILED")]
+    assert len(store.active) == 1
+    assert store.active[0]["simulation_job_id"] == 11
+
+
+def test_other_running_run_is_not_released(store):
+    store.active.append({"assignment_id": 40, "crane_id": "C1",
+                         "simulation_job_id": 4, "job_id": "OLD",
+                         "run_id": 3, "run_status": "RUNNING"})
+    with pytest.raises(AssignmentConflictError, match="active assignment in run 3"):
+        _persist_snapshot(request_for_run(), snapshot("ACTIVE", "ASSIGNED", assigned_job="J1"))
+    assert store.released == []
+    assert store.inserted == []
+
+
+def test_same_job_label_in_previous_run_is_not_mistaken_for_current(store):
+    store.active.append({"assignment_id": 40, "crane_id": "C1",
+                         "simulation_job_id": 4, "job_id": "J1",
+                         "run_id": 3, "run_status": "COMPLETED"})
+    _persist_snapshot(request_for_run(), snapshot("ACTIVE", "ASSIGNED", assigned_job="J1"))
+    assert store.released == [(40, "STALE_ASSIGNMENT_RECONCILED")]
+    assert store.active[0]["simulation_job_id"] == 11
+
+
 def test_completion_releases_and_continuation_assigns_next_job(store):
     request = request_for_run()
     _persist_snapshot(request, snapshot("ACTIVE", "ASSIGNED", assigned_job="J1"))
@@ -127,6 +166,7 @@ def test_completion_releases_and_continuation_assigns_next_job(store):
     assert store.active[0]["simulation_job_id"] == 12
     assert store.jobs["J1"]["status"] == "COMPLETED"
     assert store.jobs["J1"]["work_remaining"] == 0
+    assert store.crane_status["C1"] == "ASSIGNED"
 
 
 def test_final_completion_releases_assignment_and_inventory_crane(store):
@@ -137,6 +177,98 @@ def test_final_completion_releases_assignment_and_inventory_crane(store):
     assert store.active == []
     assert store.released == [(1, "JOB_COMPLETED")]
     assert store.statuses[-1] == [{"crane_id": "C1", "status": "AVAILABLE"}]
+    assert store.crane_status["C1"] == "AVAILABLE"
+    _persist_snapshot(request, completed)
+    assert store.released == [(1, "JOB_COMPLETED")]
+
+
+def test_two_completed_jobs_release_both_cranes(store):
+    request = request_for_run()
+    active = snapshot("ACTIVE", "ASSIGNED", assigned_job="J1")
+    active["jobs"].append({"job_id": "J2", "state": "ACTIVE",
+                           "work_completed": 0, "work_remaining": 2})
+    active["cranes"].append({"crane_id": "C2", "status": "ASSIGNED",
+                             "assigned_job": "J2"})
+    _persist_snapshot(request, active)
+    completed = snapshot("COMPLETED", "AVAILABLE")
+    completed["jobs"].append({"job_id": "J2", "state": "COMPLETED",
+                              "work_completed": 2, "work_remaining": 0})
+    completed["cranes"].append({"crane_id": "C2", "status": "AVAILABLE",
+                                "assigned_job": ""})
+    _persist_snapshot(request, completed)
+    assert store.active == []
+    assert len(store.released) == 2
+    assert store.crane_status == {"C1": "AVAILABLE", "C2": "AVAILABLE"}
+
+
+def test_manual_complete_commits_job_release_and_crane_status_together(store):
+    _persist_snapshot(request_for_run(), snapshot("ACTIVE", "ASSIGNED", assigned_job="J1"))
+
+    class CompletionBridge:
+        is_alive = True
+
+        def send(self, command):
+            if command["cmd"] == "complete_job":
+                return {"ok": True, "job_id": "J1", "state": "COMPLETED"}
+            assert command["cmd"] == "snapshot"
+            return snapshot("COMPLETED", "AVAILABLE")
+
+    app = FastAPI()
+    app.include_router(router)
+    app.state.bridge = CompletionBridge()
+    app.state.db_pool = SimpleNamespace(is_open=True)
+    app.state.current_run_id = 7
+    app.state.execution = SimulationExecution(app.state.bridge)
+    response = TestClient(app, raise_server_exceptions=False).post(
+        "/simulation/jobs/J1/complete")
+    assert response.status_code == 200
+    assert store.jobs["J1"]["status"] == "COMPLETED"
+    assert store.active == []
+    assert store.released == [(1, "JOB_COMPLETED")]
+    assert store.crane_status["C1"] == "AVAILABLE"
+
+
+def test_run_completion_releases_assignment_and_repeated_step_is_idempotent(store):
+    _persist_snapshot(request_for_run(), snapshot("ACTIVE", "ASSIGNED", assigned_job="J1"))
+
+    class RunBridge:
+        is_alive = True
+
+        def __init__(self):
+            self.progress = 0
+
+        def send(self, command):
+            if command["cmd"] == "step":
+                self.progress = min(self.progress + 1, 2)
+                return {"ok": True, "advanced_jobs": ["J1"], "dispatched_jobs": []}
+            assert command["cmd"] == "snapshot"
+            if self.progress == 2:
+                return snapshot("COMPLETED", "AVAILABLE")
+            result = snapshot("ACTIVE", "ASSIGNED", assigned_job="J1")
+            result["jobs"][0].update(work_completed=self.progress,
+                                      work_remaining=2 - self.progress)
+            return result
+
+    app = FastAPI()
+    app.include_router(router)
+    app.state.bridge = RunBridge()
+    app.state.db_pool = SimpleNamespace(is_open=True)
+    app.state.current_run_id = 7
+    app.state.execution = SimulationExecution(app.state.bridge)
+    with TestClient(app, raise_server_exceptions=False) as client:
+        assert client.post("/simulation/run", json={"interval_seconds": 0.05}).status_code == 200
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            if client.get("/simulation/execution").json()["state"] == "completed":
+                break
+            time.sleep(0.01)
+        else:
+            pytest.fail("runner did not complete")
+        assert client.post("/simulation/step").status_code == 200
+    assert store.jobs["J1"]["status"] == "COMPLETED"
+    assert store.active == []
+    assert store.released == [(1, "JOB_COMPLETED")]
+    assert store.crane_status["C1"] == "AVAILABLE"
 
 
 def test_failure_and_recovery_create_no_duplicate_active_assignment(store):
@@ -150,6 +282,39 @@ def test_failure_and_recovery_create_no_duplicate_active_assignment(store):
     assert store.released == [(1, "CRANE_FAILED")]
     assert len(store.inserted) == 2
     assert len(store.active) == 1
+
+
+def test_recovery_endpoint_commits_final_reassignment_with_event(store):
+    request = request_for_run()
+    _persist_snapshot(request, snapshot("ACTIVE", "ASSIGNED", assigned_job="J1"))
+    _persist_snapshot(request, snapshot("INTERRUPTED", "FAILED"))
+
+    class RecoveryBridge:
+        is_alive = True
+
+        def send(self, command):
+            if command["cmd"] == "snapshot":
+                return snapshot("ACTIVE", "ASSIGNED", assigned_job="J1")
+            assert command == {"cmd": "crane_recovered", "crane_id": "C1"}
+            return {"ok": True, "crane_id": "C1", "job_dispatched": True,
+                    "dispatched_job_id": "J1"}
+
+    app = FastAPI()
+    app.include_router(router)
+    app.state.bridge = RecoveryBridge()
+    app.state.db_pool = SimpleNamespace(is_open=True)
+    app.state.current_run_id = 7
+    app.state.execution = SimulationExecution(app.state.bridge)
+    with patch("backend.app.router.insert_disruption_event", return_value=1) as event:
+        response = TestClient(app, raise_server_exceptions=False).post(
+            "/simulation/cranes/C1/recover")
+    assert response.status_code == 200
+    assert response.json()["status"] == "ASSIGNED"
+    assert store.released == [(1, "CRANE_FAILED")]
+    assert len(store.active) == 1
+    assert store.active[0]["simulation_job_id"] == 11
+    assert store.statuses[-1] == [{"crane_id": "C1", "status": "ASSIGNED"}]
+    event.assert_called_once()
 
 
 def test_snapshot_never_links_crane_to_missing_or_other_run_job(store):

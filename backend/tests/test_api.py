@@ -22,6 +22,7 @@ _BACKEND_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_BACKEND_DIR.parent))
 
 from fastapi.testclient import TestClient
+from fastapi import HTTPException
 
 from backend.app.cpp_bridge import (
     CppBridgeDeadError,
@@ -662,6 +663,16 @@ class TestCranePersistence:
         assert fake.last_command is None
         upsert.assert_not_called()
 
+    @pytest.mark.parametrize("legacy_id", ["CRANE_01", "c1", "C13"])
+    def test_legacy_crane_cannot_register_even_if_row_exists(self, legacy_id):
+        fake = FakeBridge()
+        client = _client(fake)
+        with patch("backend.app.router.get_crane") as get_crane:
+            response = client.post("/simulation/cranes", json={"crane_id": legacy_id})
+        assert response.status_code == 404
+        assert fake.last_command is None
+        get_crane.assert_not_called()
+
     def test_duplicate_runtime_crane_is_conflict(self):
         fake = FakeBridge(response={"ok": False, "error": "Duplicate crane ID: C1"})
         client = _client(fake)
@@ -687,6 +698,26 @@ class TestCranePersistence:
         client = TestClient(app, raise_server_exceptions=False)
         assert client.post("/simulation/cranes", json={"crane_id": "C1"}).status_code == 503
         assert fake.last_command is None
+
+    @pytest.mark.parametrize("run_status, expected", [
+        ("RUNNING", 409), ("FAILED", 200), ("COMPLETED", 200),
+    ])
+    def test_available_crane_with_old_assignment(self, run_status, expected):
+        fake = FakeBridge(response={"ok": True, "crane_id": "C1"})
+        client = _client(fake)
+        old = {"assignment_id": 9, "crane_id": "C1", "run_id": 3,
+               "run_status": run_status}
+        with patch("backend.app.router.get_crane", return_value={"crane_id": "C1", "status": "AVAILABLE"}), \
+             patch("backend.app.router.get_active_assignments_for_cranes", return_value=[old]), \
+             patch("backend.app.router.release_crane_assignment", return_value=True) as release:
+            resp = client.post("/simulation/cranes", json={"crane_id": "C1"})
+        assert resp.status_code == expected
+        if run_status == "RUNNING":
+            release.assert_not_called()
+            assert fake.last_command is None
+        else:
+            release.assert_called_once()
+            assert fake.last_command == {"cmd": "register_crane", "crane_id": "C1"}
 
 
 # ─── Persistence: POST /simulation/jobs ───────────────────────────────────────
@@ -841,83 +872,43 @@ class TestJobCompletionPersistence:
         with patch("backend.app.router._sync_crane_statuses"):
             yield
 
-    @patch("backend.app.router.update_job_status")
-    @patch("backend.app.router.get_connection")
-    def test_job_completion_updates_status(
-        self, mock_get_conn: MagicMock, mock_update: MagicMock
-    ):
-        """Successful C++ complete → update_job_status called with COMPLETED."""
-        mock_conn = MagicMock()
-        mock_get_conn.return_value.__enter__ = MagicMock(return_value=mock_conn)
-        mock_get_conn.return_value.__exit__ = MagicMock(return_value=False)
-        mock_update.return_value = True
-
+    def test_job_completion_uses_snapshot_path(self):
+        """The route delegates persistence to its snapshot path."""
         fake = FakeBridge(response={"ok": True, "job_id": "J1", "state": "COMPLETED"})
         pool = FakeDBPool(is_open=True, healthy=True)
         client = _client(fake, pool)
         app.state.current_run_id = 42
-
-        resp = client.post("/simulation/jobs/J1/complete")
+        with patch("backend.app.router._sync_crane_statuses") as sync:
+            resp = client.post("/simulation/jobs/J1/complete")
 
         assert resp.status_code == 200
         assert resp.json()["state"] == "COMPLETED"
+        sync.assert_called_once()
 
-        mock_update.assert_called_once()
-        call_kwargs = mock_update.call_args[1]
-        assert call_kwargs["run_id"] == 42
-        assert call_kwargs["job_id"] == "J1"
-        assert call_kwargs["status"] == "COMPLETED"
-
-    @patch("backend.app.router.release_active_crane_assignments_by_job")
-    @patch("backend.app.router.get_simulation_job_id", return_value=101)
-    @patch("backend.app.router.update_job_status")
-    @patch("backend.app.router.get_connection")
-    def test_job_completion_releases_crane_assignments(
-        self,
-        mock_get_conn: MagicMock,
-        mock_update: MagicMock,
-        mock_get_sim_id: MagicMock,
-        mock_release_asgn: MagicMock,
-    ):
-        """Successful C++ completion releases all active crane assignments for the job."""
-        mock_conn = MagicMock()
-        mock_get_conn.return_value.__enter__ = MagicMock(return_value=mock_conn)
-        mock_get_conn.return_value.__exit__ = MagicMock(return_value=False)
-        mock_update.return_value = True
-
+    def test_job_completion_skips_separate_assignment_release(self):
+        """The route does not make a separate, nontransactional release."""
         fake = FakeBridge(response={"ok": True, "job_id": "JOB_NEW", "state": "COMPLETED"})
         pool = FakeDBPool(is_open=True, healthy=True)
         client = _client(fake, pool)
         app.state.current_run_id = 42
-
-        resp = client.post("/simulation/jobs/JOB_NEW/complete")
+        with patch("backend.app.router.release_active_crane_assignments_by_job") as release:
+            resp = client.post("/simulation/jobs/JOB_NEW/complete")
         assert resp.status_code == 200
-        mock_get_sim_id.assert_called_once_with(mock_conn, run_id=42, job_id="JOB_NEW")
-        mock_release_asgn.assert_called_once_with(
-            mock_conn, simulation_job_id=101, release_reason="JOB_COMPLETED"
-        )
+        release.assert_not_called()
 
-    @patch("backend.app.router.update_job_status")
-    @patch("backend.app.router.get_connection")
-    def test_job_completion_db_failure_still_returns_200(
-        self, mock_get_conn: MagicMock, mock_update: MagicMock
-    ):
-        """If the DB update raises, C++ success still returns 200."""
-        mock_conn = MagicMock()
-        mock_get_conn.return_value.__enter__ = MagicMock(return_value=mock_conn)
-        mock_get_conn.return_value.__exit__ = MagicMock(return_value=False)
-        mock_update.side_effect = RuntimeError("connection refused")
-
+    def test_job_completion_db_failure_reports_reconciliation(self):
+        """C++ success with persistence failure is reported as partial success."""
         fake = FakeBridge(response={"ok": True, "job_id": "J1", "state": "COMPLETED"})
         pool = FakeDBPool(is_open=True, healthy=True)
         client = _client(fake, pool)
         app.state.current_run_id = 42
 
-        resp = client.post("/simulation/jobs/J1/complete")
+        with patch("backend.app.router._sync_crane_statuses",
+                   side_effect=HTTPException(status_code=503, detail="Database synchronization failed")):
+            resp = client.post("/simulation/jobs/J1/complete")
 
-        assert resp.status_code == 200
-        assert resp.json()["ok"] is True
-        assert resp.json()["state"] == "COMPLETED"
+        assert resp.status_code == 503
+        assert fake.last_command["cmd"] == "complete_job"
 
     def test_job_completion_no_run_id_still_returns_200(self):
         """No current_run_id → skip persistence, return 200."""
@@ -1324,23 +1315,34 @@ class TestSimulationCraneRecover:
 
     @pytest.fixture(autouse=True)
     def isolate_snapshot_reconciliation(self):
-        with patch("backend.app.router._sync_crane_statuses"):
+        with patch("backend.app.router._persist_snapshot"):
             yield
+
+    @staticmethod
+    def recovery_bridge(*, dispatched=False, status="AVAILABLE"):
+        fake = FakeBridge()
+
+        def send(command):
+            fake.last_command = command
+            if command["cmd"] == "snapshot":
+                return {"ok": True, "cranes": [{"crane_id": "CR-1", "status": status,
+                                                 "assigned_job": "JOB-88" if dispatched else ""}],
+                        "jobs": []}
+            return {"ok": True, "crane_id": "CR-1", "job_dispatched": dispatched,
+                    "dispatched_job_id": "JOB-88" if dispatched else ""}
+
+        fake.send = send
+        return fake
 
     def test_recover_crane_success(self):
         """Recovering a FAILED crane sends crane_recovered, updates DB and disruption events."""
-        fake = FakeBridge(response={
-            "ok": True,
-            "crane_id": "CR-1",
-            "job_dispatched": False,
-            "dispatched_job_id": "",
-        })
+        fake = self.recovery_bridge()
         pool = FakeDBPool(is_open=True, healthy=True)
         client = _client(fake, pool)
         app.state.current_run_id = 12
 
-        with patch("backend.app.router.update_crane_status", return_value=True) as mock_update, \
-             patch("backend.app.router.insert_disruption_event", return_value=3) as mock_event:
+        with patch("backend.app.router.insert_disruption_event", return_value=3) as mock_event, \
+             patch("backend.app.router._persist_snapshot") as mock_persist:
             resp = client.post("/simulation/cranes/CR-1/recover")
             assert resp.status_code == 200
             data = resp.json()
@@ -1349,52 +1351,42 @@ class TestSimulationCraneRecover:
             assert data["status"] == "AVAILABLE"
             assert data["job_dispatched"] is False
 
-            mock_update.assert_called_once()
-            assert mock_update.call_args.kwargs["status"] == "AVAILABLE"
+            mock_persist.assert_called_once()
+            assert mock_persist.call_args.kwargs["conn"] is pool.last_conn
             mock_event.assert_called_once()
             assert mock_event.call_args.kwargs["event_type"] == "CRANE_RECOVERED"
 
     def test_recover_crane_dispatches_waiting_job(self):
         """When recovered crane enables dispatch of an interrupted job, dispatched_job_id is returned."""
-        fake = FakeBridge(response={
-            "ok": True,
-            "crane_id": "CR-1",
-            "job_dispatched": True,
-            "dispatched_job_id": "JOB-88",
-        })
+        fake = self.recovery_bridge(dispatched=True, status="ASSIGNED")
         pool = FakeDBPool(is_open=True, healthy=True)
         client = _client(fake, pool)
+        app.state.current_run_id = 12
 
-        with patch("backend.app.router.update_crane_status", return_value=True):
+        with patch("backend.app.router.insert_disruption_event", return_value=3):
             resp = client.post("/simulation/cranes/CR-1/recover")
             assert resp.status_code == 200
             data = resp.json()
             assert data["job_dispatched"] is True
             assert data["dispatched_job_id"] == "JOB-88"
+            assert data["status"] == "ASSIGNED"
 
     def test_recover_crane_dispatches_waiting_job_with_db_persistence(self):
         """Recovery records the event; snapshot reconciliation owns assignment persistence."""
-        fake = FakeBridge(response={
-            "ok": True,
-            "crane_id": "CR-1",
-            "job_dispatched": True,
-            "dispatched_job_id": "JOB_NEW",
-        })
+        fake = self.recovery_bridge(dispatched=True, status="ASSIGNED")
         pool = FakeDBPool(is_open=True, healthy=True)
         client = _client(fake, pool)
         app.state.current_run_id = 15
 
-        with patch("backend.app.router.update_crane_status", return_value=True), \
-             patch("backend.app.router.insert_disruption_event", return_value=1) as mock_event, \
+        with patch("backend.app.router.insert_disruption_event", return_value=1) as mock_event, \
              patch("backend.app.router.get_simulation_job_id", return_value=99) as mock_sim_id, \
              patch("backend.app.router.insert_crane_assignment", return_value=12) as mock_asgn, \
-             patch("backend.app.router.update_job_status", return_value=True) as mock_job_status, \
-             patch("backend.app.router._sync_crane_statuses"):
+             patch("backend.app.router.update_job_status", return_value=True) as mock_job_status:
             resp = client.post("/simulation/cranes/CR-1/recover")
             assert resp.status_code == 200
             data = resp.json()
             assert data["job_dispatched"] is True
-            assert data["dispatched_job_id"] == "JOB_NEW"
+            assert data["dispatched_job_id"] == "JOB-88"
             assert mock_event.called
             mock_sim_id.assert_not_called()
             mock_asgn.assert_not_called()
@@ -1417,15 +1409,21 @@ class TestSimulationCraneRecover:
         assert "not in FAILED state" in resp.json()["detail"]
 
     def test_recover_crane_db_failure_requires_reconciliation(self):
-        """When DB persistence fails after crane recovery, reports 500 with reconciliation required."""
-        fake = FakeBridge(response={"ok": True, "crane_id": "CR-1", "job_dispatched": False})
+        """A DB failure reports the successful C++ change without leaking DB details."""
+        fake = self.recovery_bridge(dispatched=True, status="ASSIGNED")
         pool = FakeDBPool(is_open=True, healthy=True)
         client = _client(fake, pool)
+        app.state.current_run_id = 12
 
-        with patch("backend.app.router.update_crane_status", side_effect=RuntimeError("DB dead")):
+        with patch("backend.app.router.insert_disruption_event", return_value=3), \
+             patch("backend.app.router._persist_snapshot", side_effect=RuntimeError("DB dead")):
             resp = client.post("/simulation/cranes/CR-1/recover")
-            assert resp.status_code == 500
-            assert "Reconciliation required" in resp.json()["detail"]
+            assert resp.status_code == 503
+            detail = resp.json()["detail"]
+            assert detail["runtime_changed"] is True
+            assert detail["crane_status"] == "ASSIGNED"
+            assert "DB dead" not in detail["message"]
+            assert pool.last_conn.rollbacks == 1
 
 
 class TestSimulationReconcile:

@@ -19,7 +19,6 @@ export default function CraneRegistry({
   onRegister,
   onFail,
   onRecover,
-  onReconcile,
   disabled,
   loading = {},
   lastFailResult,
@@ -27,7 +26,8 @@ export default function CraneRegistry({
   const [craneId, setCraneId] = useState('')
   const registeredIds = new Set(cranes.map(crane => crane.crane_id))
   const eligible = (inventory?.cranes ?? []).filter(
-    crane => crane.status === 'AVAILABLE' && !registeredIds.has(crane.crane_id)
+    crane => /^C(?:[1-9]|1[0-2])$/.test(crane.crane_id) &&
+      crane.status === 'AVAILABLE' && !registeredIds.has(crane.crane_id)
   )
   const selectedCraneId = eligible.some(crane => crane.crane_id === craneId) ? craneId : ''
 
@@ -109,17 +109,6 @@ export default function CraneRegistry({
           {lastFailResult.db_sync_warning && (
             <div style={{ marginTop: 'var(--space-1)', color: 'var(--clr-err)' }}>
               ⚠ {lastFailResult.db_sync_warning}
-              {onReconcile && (
-                <button
-                  id="btn-crane-reconcile-sync"
-                  className="btn btn--outline btn--sm"
-                  style={{ marginLeft: 'var(--space-3)' }}
-                  onClick={onReconcile}
-                  disabled={loading.reconcile}
-                >
-                  {loading.reconcile ? 'Syncing…' : '⚖ Reconcile Now'}
-                </button>
-              )}
             </div>
           )}
         </div>

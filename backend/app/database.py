@@ -30,6 +30,7 @@ import psycopg2.pool
 from .config import get_db_config
 
 logger = logging.getLogger(__name__)
+ACTIVE_CRANE_IDS = tuple(f"C{i}" for i in range(1, 13))
 
 
 # ─── Pool lifecycle ───────────────────────────────────────────────────────────
@@ -49,6 +50,7 @@ class DatabasePool:
         self._minconn = minconn
         self._maxconn = maxconn
         self._pool: psycopg2.pool.ThreadedConnectionPool | None = None
+        self._owner_conn = None
 
     @property
     def is_open(self) -> bool:
@@ -86,6 +88,17 @@ class DatabasePool:
     def close(self) -> None:
         """Close all pooled connections. Safe to call more than once."""
         if self._pool is not None:
+            if self._owner_conn is not None:
+                try:
+                    with self._owner_conn.cursor() as cur:
+                        cur.execute("SELECT pg_advisory_unlock(4407366, 1)")
+                    self._owner_conn.commit()
+                except Exception as exc:
+                    logger.warning("Could not explicitly release backend ownership lock: %s",
+                                   type(exc).__name__)
+                finally:
+                    self._pool.putconn(self._owner_conn, close=True)
+                    self._owner_conn = None
             self._pool.closeall()
             self._pool = None
             logger.info("Database pool closed")
@@ -106,6 +119,31 @@ class DatabasePool:
         """Return a connection to the pool."""
         if self._pool is not None:
             self._pool.putconn(conn, close=close)
+
+    def acquire_session_ownership(self) -> bool:
+        """Hold one PostgreSQL advisory lock for the whole backend session.
+
+        A second cooperative worker must fail startup instead of resetting the
+        first worker's live inventory. The reserved connection is never lent
+        to a request and is released when the pool closes.
+        """
+        if self._owner_conn is not None:
+            return True
+        conn = self.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT pg_try_advisory_lock(4407366, 1)")
+                acquired = bool(cur.fetchone()[0])
+            conn.commit()
+            if acquired:
+                self._owner_conn = conn
+                return True
+            self.putconn(conn)
+            return False
+        except Exception:
+            conn.rollback()
+            self.putconn(conn, close=True)
+            raise
 
 
 @contextmanager
@@ -155,6 +193,59 @@ def check_connection(conn) -> bool:
             return row is not None and row[0] == 1
     except Exception:
         return False
+
+
+def initialize_backend_inventory(conn) -> None:
+    """Create the twelve demo cranes and retire state from prior sessions.
+
+    Called once per FastAPI lifespan, under session ownership and one database
+    transaction. Existing crane rows and all historical records are retained.
+    """
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO terminals (terminal_name, description)
+            VALUES ('Demo Terminal', 'Primary demonstration terminal used for simulation scenarios.')
+            ON CONFLICT (terminal_name) DO NOTHING
+        """)
+        cur.execute("""
+            INSERT INTO cranes (crane_id, terminal_id, status)
+            SELECT ids.crane_id, t.terminal_id, 'AVAILABLE'
+              FROM terminals t
+              CROSS JOIN unnest(%(crane_ids)s::varchar[]) AS ids(crane_id)
+             WHERE t.terminal_name = 'Demo Terminal'
+            ON CONFLICT (crane_id) DO NOTHING
+        """, {"crane_ids": list(ACTIVE_CRANE_IDS)})
+        # No prior C++ dispatcher survives a backend process restart. Preserve
+        # completed jobs and all rows; only unfinished runs/jobs are closed.
+        cur.execute("""
+            UPDATE simulation_runs
+               SET status = 'FAILED', ended_at = now()
+             WHERE status = 'RUNNING'
+            RETURNING run_id
+        """)
+        abandoned_run_ids = [row[0] for row in cur.fetchall()]
+        if abandoned_run_ids:
+            cur.execute("""
+                UPDATE simulation_jobs
+                   SET status = 'CANCELLED', completed_at = now(),
+                       allocated_berths = 0, allocated_cranes = 0,
+                       allocated_trucks = 0
+                 WHERE run_id = ANY(%(run_ids)s)
+                   AND status IN ('PENDING', 'ACTIVE', 'INTERRUPTED')
+            """, {"run_ids": abandoned_run_ids})
+        # Even a terminal run may contain an old unreleased assignment after
+        # interrupted persistence. At startup every such row is stale.
+        cur.execute("""
+            UPDATE crane_assignments
+               SET released_at = now(), release_reason = 'BACKEND_RESTART'
+             WHERE released_at IS NULL
+        """)
+        cur.execute("""
+            UPDATE cranes
+               SET status = 'AVAILABLE', updated_at = now()
+             WHERE crane_id = ANY(%(crane_ids)s)
+               AND status <> 'AVAILABLE'
+        """, {"crane_ids": list(ACTIVE_CRANE_IDS)})
 
 
 # ── 1. Cranes ─────────────────────────────────────────────────────────────────
@@ -617,6 +708,36 @@ def get_active_assignments_for_run(conn, run_id: int) -> list[dict[str, Any]]:
         return [dict(row) for row in cur.fetchall()]
 
 
+def get_active_assignments_for_cranes(conn, crane_ids: list[str]) -> list[dict[str, Any]]:
+    """Lock physical cranes, then inspect their active assignments across all runs.
+
+    Snapshot reconciliation and registration lock crane rows before inspecting
+    assignments. Sorting the IDs prevents those transactions from taking locks
+    in opposite orders. The partial unique index remains the final safeguard.
+    """
+    if not crane_ids:
+        return []
+    ids = sorted(set(crane_ids))
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT crane_id FROM cranes
+             WHERE crane_id = ANY(%(crane_ids)s)
+             ORDER BY crane_id FOR UPDATE
+        """, {"crane_ids": ids})
+        cur.fetchall()
+    with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+        cur.execute("""
+            SELECT a.assignment_id, a.crane_id, a.simulation_job_id,
+                   j.job_id, j.run_id, r.status AS run_status
+              FROM crane_assignments a
+              JOIN simulation_jobs j ON j.simulation_job_id = a.simulation_job_id
+              JOIN simulation_runs r ON r.run_id = j.run_id
+             WHERE a.crane_id = ANY(%(crane_ids)s)
+               AND a.released_at IS NULL
+        """, {"crane_ids": ids})
+        return [dict(row) for row in cur.fetchall()]
+
+
 def release_active_assignments_for_run(conn, run_id: int, reason: str) -> int:
     """Close assignment history for one run; repeated calls are harmless."""
     with conn.cursor() as cur:
@@ -688,7 +809,7 @@ def get_resource_inventory(conn) -> dict[str, list[dict[str, Any]]]:
     Queries three tables in a single connection:
       - terminals  : all terminal records
       - berths     : all berth records (ordered by terminal then berth)
-      - cranes     : all crane records (ordered by terminal then crane_id)
+      - cranes     : the twelve active demo cranes only
 
     ``updated_at`` on cranes is serialised to an ISO-8601 string so the
     result is directly JSON-serialisable.
@@ -709,7 +830,8 @@ def get_resource_inventory(conn) -> dict[str, list[dict[str, Any]]]:
     cranes_sql = """
         SELECT crane_id, terminal_id, status, updated_at
           FROM cranes
-         ORDER BY terminal_id, crane_id
+         WHERE crane_id = ANY(%(crane_ids)s)
+         ORDER BY length(crane_id), crane_id
     """
     result: dict[str, list[dict[str, Any]]] = {
         "terminals": [],
@@ -724,7 +846,7 @@ def get_resource_inventory(conn) -> dict[str, list[dict[str, Any]]]:
         cur.execute(berths_sql)
         result["berths"] = [dict(row) for row in cur.fetchall()]
 
-        cur.execute(cranes_sql)
+        cur.execute(cranes_sql, {"crane_ids": list(ACTIVE_CRANE_IDS)})
         rows = cur.fetchall()
 
     # Convert datetime objects to ISO strings so FastAPI can serialise them.

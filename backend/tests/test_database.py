@@ -14,16 +14,19 @@ import pytest
 
 from backend.app.config import get_db_config
 from backend.app.database import (
+    ACTIVE_CRANE_IDS,
     DatabasePool,
     cancel_unfinished_jobs_for_run,
     check_connection,
     close_simulation_run,
     get_active_assignments_for_run,
+    get_active_assignments_for_cranes,
     get_connection,
     get_crane,
     get_disruption_events_for_run,
     get_jobs_for_run,
     get_resource_inventory,
+    initialize_backend_inventory,
     get_simulation_job_id,
     get_simulation_run,
     insert_crane_assignment,
@@ -41,6 +44,55 @@ from backend.app.database import (
     update_job_work_progress,
     upsert_crane,
 )
+
+
+def test_startup_inventory_is_idempotent_and_preserves_history() -> None:
+    conn = MagicMock()
+    cursor = conn.cursor.return_value.__enter__.return_value
+    cursor.fetchall.side_effect = [[(7,), (8,)], []]
+
+    initialize_backend_inventory(conn)
+    initialize_backend_inventory(conn)
+
+    statements = [call.args[0] for call in cursor.execute.call_args_list]
+    assert len(ACTIVE_CRANE_IDS) == 12
+    assert ACTIVE_CRANE_IDS == tuple(f"C{i}" for i in range(1, 13))
+    assert sum("INSERT INTO cranes" in sql for sql in statements) == 2
+    assert all("ON CONFLICT (crane_id) DO NOTHING" in sql for sql in statements
+               if "INSERT INTO cranes" in sql)
+    assert all("DELETE " not in sql and "TRUNCATE " not in sql for sql in statements)
+    assert sum("UPDATE simulation_jobs" in sql for sql in statements) == 1
+    cancel_call = next(call for call in cursor.execute.call_args_list
+                       if "UPDATE simulation_jobs" in call.args[0])
+    assert cancel_call.args[1] == {"run_ids": [7, 8]}
+    assert "status IN ('PENDING', 'ACTIVE', 'INTERRUPTED')" in cancel_call.args[0]
+    assert sum("UPDATE crane_assignments" in sql for sql in statements) == 2
+    assert all("released_at IS NULL" in sql for sql in statements
+               if "UPDATE crane_assignments" in sql)
+    assert all("crane_id = ANY(%(crane_ids)s)" in sql for sql in statements
+               if "UPDATE cranes" in sql)
+
+
+def test_startup_inventory_transaction_rolls_back_on_error() -> None:
+    pool = MagicMock()
+    conn = pool.getconn.return_value
+    cursor = conn.cursor.return_value.__enter__.return_value
+    cursor.execute.side_effect = RuntimeError("isolated database failure")
+    with pytest.raises(RuntimeError, match="isolated database failure"):
+        with get_connection(pool) as connection:
+            initialize_backend_inventory(connection)
+    conn.rollback.assert_called_once()
+    conn.commit.assert_not_called()
+
+
+def test_second_backend_cannot_acquire_session_ownership() -> None:
+    pool = DatabasePool()
+    pool._pool = MagicMock()
+    conn = pool._pool.getconn.return_value
+    conn.cursor.return_value.__enter__.return_value.fetchone.return_value = (False,)
+    assert pool.acquire_session_ownership() is False
+    assert pool._owner_conn is None
+    pool._pool.putconn.assert_called_once_with(conn, close=False)
 
 
 def test_reset_queries_are_scoped_and_preserve_failed_cranes() -> None:
@@ -82,6 +134,23 @@ def test_active_assignment_query_joins_jobs_by_run() -> None:
     assert "JOIN simulation_jobs" in sql
     assert "j.run_id = %(run_id)s" in sql
     assert params == {"run_id": 7}
+
+
+def test_active_assignment_query_locks_cranes_and_checks_all_runs() -> None:
+    conn = MagicMock()
+    cursor = conn.cursor.return_value.__enter__.return_value
+    cursor.fetchall.return_value = [{"assignment_id": 1, "crane_id": "C1",
+                                      "simulation_job_id": 11, "job_id": "J1",
+                                      "run_id": 3, "run_status": "FAILED"}]
+    rows = get_active_assignments_for_cranes(conn, ["C2", "C1", "C1"])
+    assert rows[0]["run_id"] == 3
+    lock_sql, lock_params = cursor.execute.call_args_list[-2].args
+    query_sql, query_params = cursor.execute.call_args_list[-1].args
+    assert "ORDER BY crane_id FOR UPDATE" in lock_sql
+    assert lock_params == {"crane_ids": ["C1", "C2"]}
+    assert "JOIN simulation_runs" in query_sql
+    assert "j.run_id =" not in query_sql
+    assert query_params == lock_params
 
 
 # ─── 1. Configuration tests ───────────────────────────────────────────────────
@@ -650,8 +719,8 @@ class TestResourceInventoryQueries:
             {"berth_id": 10, "terminal_id": 1, "berth_name": "Berth 1"}
         ]
         cranes = [
-            {"crane_id": "CR-1", "terminal_id": 1, "status": "AVAILABLE", "updated_at": ts},
-            {"crane_id": "CR-2", "terminal_id": 1, "status": "ASSIGNED", "updated_at": None},
+            {"crane_id": "C1", "terminal_id": 1, "status": "AVAILABLE", "updated_at": ts},
+            {"crane_id": "C2", "terminal_id": 1, "status": "ASSIGNED", "updated_at": None},
         ]
         mock_cur.fetchall.side_effect = [terminals, berths, cranes]
 
@@ -665,9 +734,9 @@ class TestResourceInventoryQueries:
         assert inv["berths"][0]["berth_name"] == "Berth 1"
 
         assert len(inv["cranes"]) == 2
-        assert inv["cranes"][0]["crane_id"] == "CR-1"
+        assert inv["cranes"][0]["crane_id"] == "C1"
         assert inv["cranes"][0]["updated_at"] == ts.isoformat()
-        assert inv["cranes"][1]["crane_id"] == "CR-2"
+        assert inv["cranes"][1]["crane_id"] == "C2"
         assert inv["cranes"][1]["updated_at"] is None
 
         # Verify SQL queries targeted the expected tables
@@ -675,6 +744,9 @@ class TestResourceInventoryQueries:
         assert any("FROM terminals" in sql for sql in executed_sqls)
         assert any("FROM berths" in sql for sql in executed_sqls)
         assert any("FROM cranes" in sql for sql in executed_sqls)
+        crane_query = mock_cur.execute.call_args_list[-1]
+        assert "WHERE crane_id = ANY(%(crane_ids)s)" in crane_query.args[0]
+        assert crane_query.args[1] == {"crane_ids": list(ACTIVE_CRANE_IDS)}
 
     def test_get_resource_inventory_db_error(self) -> None:
         """Database errors during execution are propagated."""

@@ -22,7 +22,6 @@ import {
   registerCrane,
   failCrane,
   recoverCrane,
-  reconcileState,
   dispatchBatch,
   fetchExecutionStatus,
   runSimulation,
@@ -136,7 +135,20 @@ export default function App() {
     return result
   }, [])
 
-  /* ── Poll only while the backend reports RUNNING ── */
+  /* ── Refresh PostgreSQL inventory ── */
+  const refreshInventory = useCallback(async () => {
+    setInventoryLoading(true)
+    setInventoryError(null)
+    const result = await fetchInventory()
+    setInventoryLoading(false)
+    if (result.ok) {
+      setInventory(result.data)
+    } else {
+      setInventoryError(result.error)
+    }
+  }, [])
+
+  /* ── Poll while automatic execution is running ── */
   useEffect(() => {
     if (execution.state !== 'running') return undefined
 
@@ -146,6 +158,8 @@ export default function App() {
       await refreshSnapshot()
       if (cancelled) return
       const statusResult = await refreshExecution({ announce: true })
+      if (cancelled) return
+      await refreshInventory()
       if (cancelled) return
       if (statusResult.ok && statusResult.data.state === 'running') {
         timerId = window.setTimeout(poll, 1000)
@@ -160,20 +174,7 @@ export default function App() {
       cancelled = true
       window.clearTimeout(timerId)
     }
-  }, [execution.state, refreshExecution, refreshSnapshot])
-
-  /* ── Refresh PostgreSQL inventory ── */
-  const refreshInventory = useCallback(async () => {
-    setInventoryLoading(true)
-    setInventoryError(null)
-    const result = await fetchInventory()
-    setInventoryLoading(false)
-    if (result.ok) {
-      setInventory(result.data)
-    } else {
-      setInventoryError(result.error)
-    }
-  }, [])
+  }, [execution.state, refreshExecution, refreshSnapshot, refreshInventory])
 
   /* ── Health check on startup ── */
   useEffect(() => {
@@ -243,6 +244,7 @@ export default function App() {
     setBusy('run', false)
     if (!result.ok) {
       setFeedback({ message: `Run failed: ${result.error}`, severity: 'err' })
+      await Promise.all([refreshSnapshot(), refreshExecution(), refreshInventory()])
       return
     }
     executionRequestRef.current += 1
@@ -273,6 +275,7 @@ export default function App() {
     setBusy('step', false)
     if (!result.ok) {
       setFeedback({ message: `Step failed: ${result.error}`, severity: 'err' })
+      await Promise.all([refreshSnapshot(), refreshExecution(), refreshInventory()])
       return
     }
     const [snapshotResult] = await Promise.all([refreshSnapshot(), refreshExecution()])
@@ -287,6 +290,7 @@ export default function App() {
     setBusy('dispatch', false)
     if (!result.ok) {
       setFeedback({ message: `Dispatch failed: ${result.error}`, severity: 'err' })
+      await Promise.all([refreshSnapshot(), refreshExecution(), refreshInventory()])
       return
     }
     const count = result.data.count ?? 0
@@ -306,6 +310,7 @@ export default function App() {
     setBusy('job', false)
     if (!result.ok) {
       setFeedback({ message: `Job submit failed: ${result.error}`, severity: 'err' })
+      await Promise.all([refreshSnapshot(), refreshExecution(), refreshInventory()])
       return
     }
     setFeedback({
@@ -324,6 +329,7 @@ export default function App() {
     setBusy(`complete-${jobId}`, false)
     if (!result.ok) {
       setFeedback({ message: `Complete "${jobId}" failed: ${result.error}`, severity: 'err' })
+      await Promise.all([refreshSnapshot(), refreshExecution(), refreshInventory()])
       return
     }
     setFeedback({
@@ -341,6 +347,7 @@ export default function App() {
     setBusy('crane', false)
     if (!result.ok) {
       setFeedback({ message: `Crane registration failed: ${result.error}`, severity: 'err' })
+      await Promise.all([refreshSnapshot(), refreshExecution(), refreshInventory()])
       return
     }
     setFeedback({
@@ -359,6 +366,7 @@ export default function App() {
     setBusy(`fail-${craneId}`, false)
     if (!result.ok) {
       setFeedback({ message: `Failed to mark crane "${craneId}" as failed: ${result.error}`, severity: 'err' })
+      await Promise.all([refreshSnapshot(), refreshExecution(), refreshInventory()])
       return
     }
     const data = result.data
@@ -387,12 +395,14 @@ export default function App() {
     const result = await recoverCrane(craneId)
     setBusy(`recover-${craneId}`, false)
     if (!result.ok) {
-      setFeedback({ message: `Failed to recover crane "${craneId}": ${result.error}`, severity: 'err' })
+      if (result.partial?.runtime_changed) setLastFailResult(null)
+      setFeedback({ message: `Crane "${craneId}": ${result.error}`, severity: 'err' })
+      await Promise.all([refreshSnapshot(), refreshExecution(), refreshInventory()])
       return
     }
     const data = result.data
     setLastFailResult(null)
-    let msg = `Crane "${craneId}" recovered to AVAILABLE.`
+    let msg = `Crane "${craneId}" recovered to ${data.status}.`
     if (data.dispatched_job_id) {
       msg += ` Job "${data.dispatched_job_id}" was dispatched.`
     }
@@ -404,23 +414,6 @@ export default function App() {
     }
     await refreshSnapshot()
     await refreshExecution({ announce: true })
-    await refreshInventory()
-  }
-
-  /* ── Reconcile state between C++ snapshot and PostgreSQL ── */
-  async function handleReconcile() {
-    setBusy('reconcile', true)
-    const result = await reconcileState()
-    setBusy('reconcile', false)
-    if (!result.ok) {
-      setFeedback({ message: `Reconciliation failed: ${result.error}`, severity: 'err' })
-    } else {
-      setFeedback({
-        message: `Reconciliation complete: ${result.data.reconciled_cranes} cranes, ${result.data.reconciled_jobs} jobs synced.`,
-        severity: 'ok',
-      })
-    }
-    await refreshSnapshot()
     await refreshInventory()
   }
 
@@ -445,15 +438,6 @@ export default function App() {
         <h1 className="app-header__logo">Container-Port-Flow</h1>
         <span className="app-header__subtitle">Port Operations Dashboard</span>
         <div style={{ marginLeft: 'auto', display: 'flex', gap: 'var(--space-2)' }}>
-          <button
-            id="btn-reconcile-state"
-            className="btn btn--outline btn--sm"
-            onClick={handleReconcile}
-            disabled={loading.reconcile}
-            title="Synchronize database records with authoritative runtime snapshot"
-          >
-            {loading.reconcile ? 'Syncing…' : '⚖ Reconcile'}
-          </button>
           <button
             id="btn-refresh-snapshot"
             className="btn btn--outline btn--sm"
@@ -548,7 +532,6 @@ export default function App() {
           onRegister={handleCraneRegister}
           onFail={handleCraneFail}
           onRecover={handleCraneRecover}
-          onReconcile={handleReconcile}
           disabled={loading.crane}
           loading={loading}
           lastFailResult={lastFailResult}

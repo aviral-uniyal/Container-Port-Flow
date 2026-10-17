@@ -332,7 +332,8 @@ def test_actual_cpp_bridge_step_and_run():
             }).status_code == 200
             client.app.state.db_pool = SimpleNamespace(is_open=True)
             with patch("backend.app.router.get_connection") as connection, \
-                 patch("backend.app.router.get_crane", return_value={"crane_id": "C1", "status": "AVAILABLE"}):
+                 patch("backend.app.router.get_crane", return_value={"crane_id": "C1", "status": "AVAILABLE"}), \
+                 patch("backend.app.router.get_active_assignments_for_cranes", return_value=[]):
                 connection.return_value.__enter__.return_value = object()
                 assert client.post("/simulation/cranes", json={"crane_id": "C1"}).status_code == 200
             client.app.state.db_pool = None
@@ -363,11 +364,21 @@ def test_application_shutdown_waits_for_runner():
         def open(self):
             pass
 
+        def acquire_session_ownership(self):
+            return True
+
+        def getconn(self):
+            return SimpleNamespace(commit=lambda: None, rollback=lambda: None)
+
+        def putconn(self, conn, close=False):
+            pass
+
         def close(self):
             pass
 
     with patch("backend.app.main.CppBridge", return_value=bridge), \
-         patch("backend.app.main.DatabasePool", return_value=Pool()):
+         patch("backend.app.main.DatabasePool", return_value=Pool()), \
+         patch("backend.app.main.initialize_backend_inventory"):
         with TestClient(main_app, raise_server_exceptions=False) as client:
             client.post("/simulation/run", json={"interval_seconds": 0.1})
             wait_for_work(bridge)
@@ -375,3 +386,59 @@ def test_application_shutdown_waits_for_runner():
         time.sleep(0.15)
         assert bridge.jobs[0]["work_completed"] == count
         assert stopped == [True]
+
+
+def test_startup_cleanup_runs_once_and_api_refresh_does_not_repeat_it():
+    bridge = WorkBridge(work=(1,))
+    bridge.start = lambda: None
+    bridge.shutdown = lambda: None
+
+    class Pool:
+        is_open = True
+
+        def open(self):
+            pass
+
+        def acquire_session_ownership(self):
+            return True
+
+        def getconn(self):
+            return SimpleNamespace(commit=lambda: None, rollback=lambda: None)
+
+        def putconn(self, conn, close=False):
+            pass
+
+        def close(self):
+            pass
+
+    with patch("backend.app.main.CppBridge", return_value=bridge), \
+         patch("backend.app.main.DatabasePool", return_value=Pool()), \
+         patch("backend.app.main.initialize_backend_inventory") as initialize:
+        with TestClient(main_app, raise_server_exceptions=False) as client:
+            assert client.get("/simulation/execution").status_code == 200
+            assert client.get("/simulation/execution").status_code == 200
+            initialize.assert_called_once()
+
+
+def test_competing_backend_startup_does_not_reset_inventory():
+    bridge = WorkBridge(work=(1,))
+    bridge.start = lambda: None
+    bridge.shutdown = lambda: None
+
+    class ContendedPool:
+        def open(self):
+            pass
+
+        def acquire_session_ownership(self):
+            return False
+
+        def close(self):
+            pass
+
+    with patch("backend.app.main.CppBridge", return_value=bridge), \
+         patch("backend.app.main.DatabasePool", return_value=ContendedPool()), \
+         patch("backend.app.main.initialize_backend_inventory") as initialize:
+        with pytest.raises(RuntimeError, match="Another backend owns"):
+            with TestClient(main_app):
+                pass
+    initialize.assert_not_called()

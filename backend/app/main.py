@@ -19,7 +19,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from .cpp_bridge import CppBridge, CppBridgeError
-from .database import DatabasePool
+from .database import DatabasePool, get_connection, initialize_backend_inventory
 from .execution import SimulationExecution
 from .router import router
 
@@ -39,17 +39,26 @@ async def lifespan(app: FastAPI):
         bridge = None  # type: ignore[assignment]
     app.state.bridge = bridge
     app.state.execution = SimulationExecution(bridge)
+    app.state.current_run_id = None
 
     # ── Database pool ─────────────────────────────────────────────────────
-    db_pool = DatabasePool()
+    db_pool = None
+    app.state.db_pool = None
     try:
-        db_pool.open()
-    except Exception as exc:
-        logger.warning("Database pool failed to open: %s", exc)
-        db_pool = None  # type: ignore[assignment]
-    app.state.db_pool = db_pool
-
-    try:
+        candidate_pool = DatabasePool()
+        try:
+            candidate_pool.open()
+        except Exception as exc:
+            logger.warning("Database pool failed to open: %s", type(exc).__name__)
+        else:
+            db_pool = candidate_pool
+            if not db_pool.acquire_session_ownership():
+                raise RuntimeError(
+                    "Another backend owns the simulation database; startup reset was not run"
+                )
+            with get_connection(db_pool) as conn:
+                initialize_backend_inventory(conn)
+        app.state.db_pool = db_pool
         yield
     finally:
         await app.state.execution.pause()
