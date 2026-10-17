@@ -93,6 +93,13 @@ struct RecoveryResult {
     bool        job_dispatched;
 };
 
+// Result of one deterministic simulated-work step.
+struct StepResult {
+    std::vector<std::string> advanced_job_ids;
+    std::vector<std::string> completed_job_ids;
+    std::vector<std::string> dispatched_job_ids;
+};
+
 // ═════════════════════════════════════════════════════════════════════════════
 // PortDispatcher
 // ═════════════════════════════════════════════════════════════════════════════
@@ -256,6 +263,12 @@ public:
     //   • empty job_id / unknown job_id / job not ACTIVE
     //   • job is ACTIVE but has fewer active cranes than job.cranes requires
     void complete_job(const std::string& job_id);
+
+    // Advance every fully supplied ACTIVE job by exactly one simulated work
+    // unit. Jobs that become ACTIVE during this operation do not advance until
+    // the next call. In batch mode, continue_batch explicitly offers any newly
+    // available capacity to queued jobs after advancement/completion.
+    StepResult step(bool continue_batch = false);
 
     // Returns true iff a job has all of its required cranes currently ASSIGNED
     // (i.e., active_cranes.size() == job.cranes).  A job may be ACTIVE but

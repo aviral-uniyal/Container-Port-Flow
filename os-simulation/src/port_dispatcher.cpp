@@ -291,21 +291,66 @@ FailureResult PortDispatcher::on_crane_failed(const std::string& crane_id,
                                                int work_completed,
                                                int work_remaining)
 {
-    // Validate parameters and delegate to DisruptionManager.
+    // Validate the legacy progress report before mutating the crane registry.
+    // The API historically supplied either:
+    //   * absolute job progress (completed + remaining == total), or
+    //   * progress since the previous failure
+    //     (completed + remaining == the dispatcher's current remaining work).
+    // Supporting both forms preserves compatibility while preventing a
+    // cumulative snapshot value from being added twice after step() has run.
+    if (work_completed < 0 || work_remaining <= 0) {
+        throw std::invalid_argument(
+            "on_crane_failed: invalid work progress for crane " + crane_id);
+    }
+    CraneState crane = registry_.get_crane(crane_id);
+    if (crane.status != CraneStatus::ASSIGNED) {
+        // Preserve DisruptionManager's existing status-specific errors.
+        dm_.fail_assigned_crane(crane_id, work_completed, work_remaining);
+    }
+
+    JobRecord& rec = find_record(crane.assigned_job);
+    const bool absolute_report =
+        (work_completed + work_remaining == rec.job.work_total);
+    const bool incremental_report =
+        (work_completed + work_remaining == rec.work_remaining);
+
+    int next_completed = rec.work_completed;
+    int next_remaining = rec.work_remaining;
+    if (absolute_report) {
+        if (work_completed < rec.work_completed ||
+            work_remaining > rec.work_remaining) {
+            throw std::invalid_argument(
+                "on_crane_failed: stale absolute work progress for job " +
+                rec.job.job_id);
+        }
+        next_completed = work_completed;
+        next_remaining = work_remaining;
+    } else if (incremental_report) {
+        next_completed += work_completed;
+        next_remaining = work_remaining;
+    } else {
+        throw std::invalid_argument(
+            "on_crane_failed: progress does not match job work total for job " +
+            rec.job.job_id);
+    }
+
+    if (next_completed + next_remaining != rec.job.work_total) {
+        throw std::invalid_argument(
+            "on_crane_failed: work progress invariant violated for job " +
+            rec.job.job_id);
+    }
+
+    // Delegate only after all dispatcher-side validation has succeeded.
     // DisruptionResult.affected_job contains the job_id.
-    // DisruptionManager also validates crane_id, work_completed, work_remaining.
     DisruptionResult dr = dm_.fail_assigned_crane(crane_id, work_completed, work_remaining);
     const std::string& job_id = dr.affected_job.job_id;
 
     // Update the job record.
-    JobRecord& rec = find_record(job_id);
     rec.active_cranes.erase(crane_id);
 
-    // Accumulate progress.
-    rec.work_completed += work_completed;
-    // work_remaining from the caller reflects the remaining total for THIS crane's
-    // share.  We update the record to the caller-supplied remaining amount.
-    rec.work_remaining = work_remaining;
+    // Apply the normalized absolute progress calculated above.
+    rec.work_completed = next_completed;
+    rec.work_remaining = next_remaining;
 
     FailureResult fr;
     fr.crane_id        = crane_id;
@@ -453,6 +498,72 @@ void PortDispatcher::complete_job(const std::string& job_id) {
 
     // Attempt to dispatch the next waiting job with the freed resources.
     try_dispatch();
+}
+
+StepResult PortDispatcher::step(bool continue_batch) {
+    StepResult result;
+
+    // Capture ACTIVE jobs before any completion can dispatch replacements.
+    // Sorting makes both processing and response order deterministic despite
+    // job_records_ being an unordered_map.
+    std::vector<std::pair<int, std::string>> active_at_start;
+    std::unordered_set<std::string> active_ids_at_start;
+    for (const auto& kv : job_records_) {
+        if (kv.second.state == JobState::ACTIVE) {
+            active_at_start.push_back({kv.second.submission_seq, kv.first});
+            active_ids_at_start.insert(kv.first);
+        }
+    }
+    std::sort(active_at_start.begin(), active_at_start.end());
+
+    std::vector<std::string> reached_zero;
+    for (const auto& entry : active_at_start) {
+        JobRecord& rec = job_records_.at(entry.second);
+
+        // A partially staffed ACTIVE job pauses until recovery tops it up.
+        if (static_cast<int>(rec.active_cranes.size()) < rec.job.cranes) {
+            continue;
+        }
+        if (rec.work_remaining <= 0) {
+            continue;
+        }
+
+        --rec.work_remaining;
+        rec.work_completed = rec.job.work_total - rec.work_remaining;
+        result.advanced_job_ids.push_back(rec.job.job_id);
+
+        if (rec.work_remaining == 0) {
+            reached_zero.push_back(rec.job.job_id);
+        }
+    }
+
+    // Reuse the existing completion path so cranes and aggregate resources are
+    // released exactly once and immediate-mode dispatch remains unchanged.
+    for (const std::string& job_id : reached_zero) {
+        complete_job(job_id);
+        result.completed_job_ids.push_back(job_id);
+    }
+
+    // Per-operation authorization for a future Run controller. A normal step
+    // leaves fresh batch jobs queued; continue_batch explicitly drains all jobs
+    // that fit after this step's work and completions.
+    if (continue_batch && !auto_dispatch_) {
+        flush_dispatch();
+    }
+
+    std::vector<std::pair<int, std::string>> newly_active;
+    for (const auto& kv : job_records_) {
+        if (kv.second.state == JobState::ACTIVE &&
+            active_ids_at_start.count(kv.first) == 0) {
+            newly_active.push_back({kv.second.submission_seq, kv.first});
+        }
+    }
+    std::sort(newly_active.begin(), newly_active.end());
+    for (const auto& entry : newly_active) {
+        result.dispatched_job_ids.push_back(entry.second);
+    }
+
+    return result;
 }
 
 // ─── Cancel job ───────────────────────────────────────────────────────────────

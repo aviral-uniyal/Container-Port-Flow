@@ -1459,6 +1459,128 @@ static bool test_batch_excessive_resource_requests_throw() {
     return true;
 }
 
+// Section 11 — Deterministic simulation work steps
+
+static bool test_step_advances_all_eligible_active_jobs() {
+    PortDispatcher pd(2, 2, 2, DispatchPolicy::FCFS);
+    pd.register_crane("C1");
+    pd.register_crane("C2");
+
+    pd.submit_job(make_job("J1", 0, 3, 1, 1, 1, 1));
+    pd.submit_job(make_job("J2", 1, 2, 1, 1, 1, 1));
+    pd.submit_job(make_job("J3", 2, 4, 1, 1, 1, 1));
+
+    StepResult result = pd.step();
+    ASSERT_TRUE(result.advanced_job_ids == std::vector<std::string>({"J1", "J2"}));
+    ASSERT_TRUE(result.completed_job_ids.empty());
+    ASSERT_TRUE(result.dispatched_job_ids.empty());
+    ASSERT_EQ(pd.job_record("J1").work_completed, 1);
+    ASSERT_EQ(pd.job_record("J1").work_remaining, 2);
+    ASSERT_EQ(pd.job_record("J2").work_completed, 1);
+    ASSERT_EQ(pd.job_record("J2").work_remaining, 1);
+    ASSERT_EQ(pd.job_record("J3").work_completed, 0);
+    ASSERT_EQ(pd.job_record("J3").work_remaining, 4);
+    ASSERT_TRUE(pd.job_state("J3") == JobState::PENDING);
+    return true;
+}
+
+static bool test_step_completion_dispatches_without_advancing_new_job() {
+    PortDispatcher pd(1, 1, 1, DispatchPolicy::FCFS);
+    pd.register_crane("C1");
+    pd.submit_job(make_job("J1", 0, 1, 1, 1, 1, 1));
+    pd.submit_job(make_job("J2", 1, 2, 1, 1, 1, 1));
+
+    StepResult first = pd.step();
+    ASSERT_TRUE(first.advanced_job_ids == std::vector<std::string>({"J1"}));
+    ASSERT_TRUE(first.completed_job_ids == std::vector<std::string>({"J1"}));
+    ASSERT_TRUE(first.dispatched_job_ids == std::vector<std::string>({"J2"}));
+    ASSERT_TRUE(pd.job_state("J1") == JobState::COMPLETED);
+    ASSERT_TRUE(pd.job_state("J2") == JobState::ACTIVE);
+    ASSERT_EQ(pd.job_record("J2").work_completed, 0);
+    ASSERT_EQ(pd.job_record("J2").work_remaining, 2);
+
+    pd.step();
+    StepResult third = pd.step();
+    ASSERT_TRUE(third.completed_job_ids == std::vector<std::string>({"J2"}));
+    ASSERT_EQ(pd.job_record("J2").work_remaining, 0);
+    ResourceSet available = pd.resource_manager().available();
+    ASSERT_EQ(available.berths, 1);
+    ASSERT_EQ(available.cranes, 1);
+    ASSERT_EQ(available.trucks, 1);
+
+    StepResult after_completion = pd.step();
+    ASSERT_TRUE(after_completion.advanced_job_ids.empty());
+    ASSERT_TRUE(after_completion.completed_job_ids.empty());
+    return true;
+}
+
+static bool test_step_batch_requires_explicit_continuation() {
+    PortDispatcher pd(1, 1, 1, DispatchPolicy::FCFS);
+    pd.register_crane("C1");
+    pd.set_auto_dispatch(false);
+    pd.submit_job(make_job("J1", 0, 1, 1, 1, 1, 1));
+    pd.submit_job(make_job("J2", 1, 2, 1, 1, 1, 1));
+    pd.flush_dispatch();
+
+    StepResult normal = pd.step();
+    ASSERT_TRUE(normal.completed_job_ids == std::vector<std::string>({"J1"}));
+    ASSERT_TRUE(normal.dispatched_job_ids.empty());
+    ASSERT_TRUE(pd.job_state("J2") == JobState::PENDING);
+
+    StepResult authorized = pd.step(true);
+    ASSERT_TRUE(authorized.advanced_job_ids.empty());
+    ASSERT_TRUE(authorized.dispatched_job_ids == std::vector<std::string>({"J2"}));
+    ASSERT_TRUE(pd.job_state("J2") == JobState::ACTIVE);
+    ASSERT_EQ(pd.job_record("J2").work_remaining, 2);
+
+    pd.step();
+    ASSERT_EQ(pd.job_record("J2").work_remaining, 1);
+    return true;
+}
+
+static bool test_step_failure_recovery_preserves_progress() {
+    PortDispatcher pd(1, 1, 1, DispatchPolicy::FCFS);
+    pd.register_crane("C1");
+    pd.submit_job(make_job("J1", 0, 3, 1, 1, 1, 1));
+
+    pd.step();
+    ASSERT_EQ(pd.job_record("J1").work_completed, 1);
+    ASSERT_EQ(pd.job_record("J1").work_remaining, 2);
+
+    // The bridge currently reports cumulative snapshot values. They must not
+    // be added to dispatcher-owned progress a second time.
+    pd.on_crane_failed("C1", 1, 2);
+    ASSERT_TRUE(pd.job_state("J1") == JobState::INTERRUPTED);
+    ASSERT_EQ(pd.job_record("J1").work_completed, 1);
+    ASSERT_EQ(pd.job_record("J1").work_remaining, 2);
+    ASSERT_TRUE(pd.step().advanced_job_ids.empty());
+
+    pd.on_crane_recovered("C1");
+    pd.step();
+    ASSERT_EQ(pd.job_record("J1").work_completed, 2);
+    ASSERT_EQ(pd.job_record("J1").work_remaining, 1);
+    return true;
+}
+
+static bool test_step_skips_undersupplied_active_job() {
+    PortDispatcher pd(1, 2, 1, DispatchPolicy::FCFS);
+    pd.register_crane("C1");
+    pd.register_crane("C2");
+    pd.submit_job(make_job("J1", 0, 3, 1, 1, 2, 1));
+
+    pd.on_crane_failed("C1", 0, 3);
+    ASSERT_TRUE(pd.job_state("J1") == JobState::ACTIVE);
+    ASSERT_EQ(pd.job_record("J1").active_cranes.size(), static_cast<size_t>(1));
+    ASSERT_TRUE(pd.step().advanced_job_ids.empty());
+    ASSERT_EQ(pd.job_record("J1").work_remaining, 3);
+
+    pd.on_crane_recovered("C1");
+    StepResult resumed = pd.step();
+    ASSERT_TRUE(resumed.advanced_job_ids == std::vector<std::string>({"J1"}));
+    ASSERT_EQ(pd.job_record("J1").work_remaining, 2);
+    return true;
+}
+
 int main() {
     std::cout << "\n=== Port Dispatcher Integration Test Suite ===\n\n";
 
@@ -1549,6 +1671,13 @@ int main() {
     run_test("Batch — idle recovery does not dispatch pending", test_batch_idle_crane_recovery_no_pending_autodispatch);
     run_test("Batch — non-preemptive behavior",                 test_batch_non_preemptive);
     run_test("Batch — excessive resource requests throw",       test_batch_excessive_resource_requests_throw);
+
+    // Section 11: Deterministic simulation work steps
+    run_test("Step — advances all eligible active jobs",        test_step_advances_all_eligible_active_jobs);
+    run_test("Step — completion dispatch waits until next step", test_step_completion_dispatches_without_advancing_new_job);
+    run_test("Step — batch continuation requires authorization", test_step_batch_requires_explicit_continuation);
+    run_test("Step — failure/recovery preserves progress",      test_step_failure_recovery_preserves_progress);
+    run_test("Step — undersupplied active job does not advance", test_step_skips_undersupplied_active_job);
 
     std::cout << "\n─── Summary ────────────────────────\n";
     std::cout << "  Total:  " << g_total  << "\n";

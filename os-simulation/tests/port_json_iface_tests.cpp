@@ -132,6 +132,7 @@ struct AdapterSim {
         if (cmd == "crane_recovered")   return do_crane_recovered(req);
         if (cmd == "dispatch_batch" || cmd == "dispatch") return do_dispatch_batch(req);
         if (cmd == "set_batch_mode")    return do_set_batch_mode(req);
+        if (cmd == "step")              return do_step(req);
         if (cmd == "snapshot")          return do_snapshot();
         if (cmd == "shutdown") {
             picojson::object r;
@@ -346,6 +347,29 @@ private:
         r["ok"] = picojson::value(true);
         r["batch_mode"] = picojson::value(batch_mode);
         return r;
+    }
+
+    picojson::object do_step(const picojson::object& req) {
+        if (!initialised) return err_resp("dispatcher not initialised");
+        bool continue_batch = false;
+        auto it = req.find("continue_batch");
+        if (it != req.end()) {
+            if (!it->second.is<bool>()) return err_resp("non-boolean field: continue_batch");
+            continue_batch = it->second.get<bool>();
+        }
+        try {
+            StepResult result = dp->step(continue_batch);
+            picojson::object r;
+            r["ok"] = picojson::value(true);
+            picojson::array advanced, completed, dispatched;
+            for (const auto& id : result.advanced_job_ids) advanced.push_back(picojson::value(id));
+            for (const auto& id : result.completed_job_ids) completed.push_back(picojson::value(id));
+            for (const auto& id : result.dispatched_job_ids) dispatched.push_back(picojson::value(id));
+            r["advanced_jobs"] = picojson::value(advanced);
+            r["completed_jobs"] = picojson::value(completed);
+            r["dispatched_jobs"] = picojson::value(dispatched);
+            return r;
+        } catch (const std::exception& ex) { return err_resp(ex.what()); }
     }
 
     picojson::object do_snapshot() {
@@ -1289,6 +1313,66 @@ static bool t_batch_mode_dynamic_toggle() {
     return true;
 }
 
+static bool t_step_progress_failure_recovery_and_completion() {
+    AdapterSim sim;
+    sim.dispatch(R"({"cmd":"init","berths":1,"cranes":1,"trucks":1,"policy":"FCFS"})");
+    sim.dispatch(R"({"cmd":"register_crane","crane_id":"C1"})");
+    sim.dispatch(R"({"cmd":"submit_job","job_id":"J1","arrival_time":0,"work_total":2,"priority":1,"berths":1,"cranes":1,"trucks":1})");
+
+    auto first = sim.dispatch(R"({"cmd":"step"})");
+    CHECK(first.at("ok").get<bool>());
+    CHECK_EQ(first.at("advanced_jobs").get<picojson::array>().size(), (size_t)1);
+    CHECK(first.at("completed_jobs").get<picojson::array>().empty());
+
+    auto snap1 = sim.dispatch(R"({"cmd":"snapshot"})");
+    auto& job1 = snap1.at("jobs").get<picojson::array>()[0].get<picojson::object>();
+    CHECK_EQ(get_int(job1, "work_completed"), 1);
+    CHECK_EQ(get_int(job1, "work_remaining"), 1);
+
+    // Cumulative snapshot progress must not be double-counted on failure.
+    sim.dispatch(R"({"cmd":"crane_failed","crane_id":"C1","work_completed":1,"work_remaining":1})");
+    auto interrupted_step = sim.dispatch(R"({"cmd":"step"})");
+    CHECK(interrupted_step.at("advanced_jobs").get<picojson::array>().empty());
+    auto snap2 = sim.dispatch(R"({"cmd":"snapshot"})");
+    auto& job2 = snap2.at("jobs").get<picojson::array>()[0].get<picojson::object>();
+    CHECK_EQ(get_str(job2, "state"), "INTERRUPTED");
+    CHECK_EQ(get_int(job2, "work_completed"), 1);
+    CHECK_EQ(get_int(job2, "work_remaining"), 1);
+
+    sim.dispatch(R"({"cmd":"crane_recovered","crane_id":"C1"})");
+    auto final_step = sim.dispatch(R"({"cmd":"step"})");
+    CHECK_EQ(final_step.at("completed_jobs").get<picojson::array>()[0].get<std::string>(), "J1");
+    auto snap3 = sim.dispatch(R"({"cmd":"snapshot"})");
+    auto& job3 = snap3.at("jobs").get<picojson::array>()[0].get<picojson::object>();
+    CHECK_EQ(get_str(job3, "state"), "COMPLETED");
+    CHECK_EQ(get_int(job3, "work_completed"), 2);
+    CHECK_EQ(get_int(job3, "work_remaining"), 0);
+    return true;
+}
+
+static bool t_step_batch_continuation_is_per_operation() {
+    AdapterSim sim;
+    sim.dispatch(R"({"cmd":"init","berths":1,"cranes":1,"trucks":1,"policy":"FCFS","batch_mode":true})");
+    sim.dispatch(R"({"cmd":"register_crane","crane_id":"C1"})");
+    sim.dispatch(R"({"cmd":"submit_job","job_id":"J1","arrival_time":0,"work_total":2,"priority":1,"berths":1,"cranes":1,"trucks":1})");
+
+    auto normal = sim.dispatch(R"({"cmd":"step"})");
+    CHECK(normal.at("advanced_jobs").get<picojson::array>().empty());
+    CHECK(normal.at("dispatched_jobs").get<picojson::array>().empty());
+
+    auto authorized = sim.dispatch(R"({"cmd":"step","continue_batch":true})");
+    CHECK(authorized.at("advanced_jobs").get<picojson::array>().empty());
+    CHECK_EQ(authorized.at("dispatched_jobs").get<picojson::array>()[0].get<std::string>(), "J1");
+
+    auto progress = sim.dispatch(R"({"cmd":"step"})");
+    CHECK_EQ(progress.at("advanced_jobs").get<picojson::array>()[0].get<std::string>(), "J1");
+    auto snap = sim.dispatch(R"({"cmd":"snapshot"})");
+    CHECK(snap.at("batch_mode").get<bool>());
+    auto& job = snap.at("jobs").get<picojson::array>()[0].get<picojson::object>();
+    CHECK_EQ(get_int(job, "work_remaining"), 1);
+    return true;
+}
+
 #include <fstream>
 #include <cstdlib>
 
@@ -1353,6 +1437,45 @@ static bool t_actual_binary_batch_dispatch_subprocess() {
     return true;
 }
 
+static bool t_actual_binary_step_subprocess() {
+    std::ofstream in("test_step_proc_in.jsonl");
+    in << "{\"cmd\":\"init\",\"berths\":1,\"cranes\":1,\"trucks\":1,\"policy\":\"FCFS\"}\n";
+    in << "{\"cmd\":\"register_crane\",\"crane_id\":\"C1\"}\n";
+    in << "{\"cmd\":\"submit_job\",\"job_id\":\"J1\",\"arrival_time\":0,\"work_total\":1,\"priority\":1,\"berths\":1,\"cranes\":1,\"trucks\":1}\n";
+    in << "{\"cmd\":\"step\"}\n";
+    in << "{\"cmd\":\"snapshot\"}\n";
+    in << "{\"cmd\":\"shutdown\"}\n";
+    in.close();
+
+    int rc = std::system(".\\port_json_iface.exe < test_step_proc_in.jsonl > test_step_proc_out.jsonl");
+    CHECK_EQ(rc, 0);
+
+    std::ifstream out("test_step_proc_out.jsonl");
+    std::vector<picojson::object> responses;
+    std::string line;
+    while (std::getline(out, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.empty()) continue;
+        picojson::value v;
+        std::string err = picojson::parse(v, line);
+        CHECK(err.empty());
+        CHECK(v.is<picojson::object>());
+        responses.push_back(v.get<picojson::object>());
+    }
+    out.close();
+
+    std::remove("test_step_proc_in.jsonl");
+    std::remove("test_step_proc_out.jsonl");
+
+    CHECK_EQ(static_cast<int>(responses.size()), 6);
+    CHECK_EQ(responses[3].at("advanced_jobs").get<picojson::array>()[0].get<std::string>(), "J1");
+    CHECK_EQ(responses[3].at("completed_jobs").get<picojson::array>()[0].get<std::string>(), "J1");
+    auto& job = responses[4].at("jobs").get<picojson::array>()[0].get<picojson::object>();
+    CHECK_EQ(get_str(job, "state"), "COMPLETED");
+    CHECK_EQ(get_int(job, "work_remaining"), 0);
+    return true;
+}
+
 int main() {
     run_test("picojson_parse_serialize",        t_picojson_parse_serialize);
     run_test("malformed_json",                  t_malformed_json);
@@ -1391,7 +1514,10 @@ int main() {
     run_test("batch_mode_init_and_submit_stays_pending", t_batch_mode_init_and_submit_stays_pending);
     run_test("batch_mode_dispatch_batch",               t_batch_mode_dispatch_batch);
     run_test("batch_mode_dynamic_toggle",               t_batch_mode_dynamic_toggle);
+    run_test("step_progress_failure_recovery_completion", t_step_progress_failure_recovery_and_completion);
+    run_test("step_batch_continuation_per_operation",   t_step_batch_continuation_is_per_operation);
     run_test("actual_binary_batch_dispatch_subprocess", t_actual_binary_batch_dispatch_subprocess);
+    run_test("actual_binary_step_subprocess",           t_actual_binary_step_subprocess);
 
     std::cerr << "\n=== Results: " << g_passed << "/" << g_total << " passed";
     if (g_failed > 0) std::cerr << ", " << g_failed << " FAILED";

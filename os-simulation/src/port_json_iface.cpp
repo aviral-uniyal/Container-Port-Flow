@@ -390,6 +390,48 @@ static void cmd_set_batch_mode(const picojson::object& req) {
     emit(r);
 }
 
+// "step": {"cmd":"step","continue_batch":false}
+static void cmd_step(const picojson::object& req) {
+    if (!g_dp) { emit_error("dispatcher not initialised"); return; }
+
+    bool continue_batch = false;
+    auto it = req.find("continue_batch");
+    if (it != req.end() && !it->second.is<bool>()) {
+        emit_error("non-boolean field: continue_batch");
+        return;
+    }
+    if (it != req.end()) {
+        continue_batch = it->second.get<bool>();
+    }
+
+    try {
+        StepResult sr = g_dp->step(continue_batch);
+        picojson::object r;
+        r["ok"] = picojson::value(true);
+
+        picojson::array advanced;
+        for (const std::string& jid : sr.advanced_job_ids) {
+            advanced.push_back(picojson::value(jid));
+        }
+        r["advanced_jobs"] = picojson::value(advanced);
+
+        picojson::array completed;
+        for (const std::string& jid : sr.completed_job_ids) {
+            completed.push_back(picojson::value(jid));
+        }
+        r["completed_jobs"] = picojson::value(completed);
+
+        picojson::array dispatched;
+        for (const std::string& jid : sr.dispatched_job_ids) {
+            dispatched.push_back(picojson::value(jid));
+        }
+        r["dispatched_jobs"] = picojson::value(dispatched);
+        emit(r);
+    } catch (const std::exception& ex) {
+        emit_error(ex.what());
+    }
+}
+
 // "snapshot": {"cmd":"snapshot"}
 static void cmd_snapshot(const picojson::object& /*req*/) {
     if (!g_dp) { emit_error("dispatcher not initialised"); return; }
@@ -541,6 +583,7 @@ int main() {
         else if (cmd == "crane_recovered")   cmd_crane_recovered(req);
         else if (cmd == "dispatch_batch" || cmd == "dispatch") cmd_dispatch_batch(req);
         else if (cmd == "set_batch_mode")    cmd_set_batch_mode(req);
+        else if (cmd == "step")              cmd_step(req);
         else if (cmd == "snapshot")          cmd_snapshot(req);
         else if (cmd == "shutdown") {
             cmd_shutdown();
