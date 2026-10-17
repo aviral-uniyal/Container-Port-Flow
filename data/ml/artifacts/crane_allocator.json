@@ -1,0 +1,12 @@
+{
+  "model_name": "CraneAllocator",
+  "min_cranes": 1,
+  "max_cranes": 6,
+  "avg_productivity_bpr": 35.0,
+  "moves_thresholds": {
+    "q25": 200.0,
+    "q50": 503.0,
+    "q75": 1136.0
+  },
+  "is_trained": true
+}

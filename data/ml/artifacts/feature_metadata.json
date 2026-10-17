@@ -1,0 +1,40 @@
+{
+  "opr_to_idx": {
+    "-": 1,
+    "ACL": 2,
+    "AL": 3,
+    "AMU": 4,
+    "BEN": 5,
+    "BTB": 6,
+    "CMA": 7,
+    "CNC": 8,
+    "CTP": 9,
+    "EVG": 10,
+    "GSL": 11,
+    "IFL": 12,
+    "JML": 13,
+    "KL": 14,
+    "LBN": 15,
+    "LKA": 16,
+    "MAE": 17,
+    "MBF": 18,
+    "MCC": 19,
+    "MRT": 20,
+    "MSC": 21,
+    "OCL": 22,
+    "PSD": 23,
+    "RCL": 24,
+    "SA": 25,
+    "SPL": 26,
+    "SSL": 27,
+    "TJM": 28,
+    "TNS": 29,
+    "YML": 30
+  },
+  "default_opr_idx": 0,
+  "feature_means": {
+    "total_teus": 1050.0631782945736,
+    "moves": 724.7240310077519,
+    "crane_ratio": 2.320315468880167
+  }
+}
