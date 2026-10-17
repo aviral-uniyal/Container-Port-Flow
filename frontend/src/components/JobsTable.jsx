@@ -1,6 +1,7 @@
 /**
  * JobsTable — shows submitted simulation jobs.
- * Columns: job ID, state, work completed, work remaining, priority, actions.
+ * Columns: job ID, state, work total, work completed, work remaining,
+ * priority, actions.
  *
  * Props:
  *   jobs       — array of job objects. Empty array shows an empty-state row.
@@ -80,6 +81,7 @@ export default function JobsTable({ jobs = [], onComplete, onDispatch, batchMode
               <th scope="col">Job ID</th>
               <th scope="col">State</th>
               <th scope="col">Work Total</th>
+              <th scope="col">Work Completed</th>
               <th scope="col">Work Remaining</th>
               <th scope="col">Priority</th>
               <th scope="col">Actions</th>
@@ -88,7 +90,7 @@ export default function JobsTable({ jobs = [], onComplete, onDispatch, batchMode
           <tbody>
             {jobs.length === 0 ? (
               <tr>
-                <td colSpan={6}>
+                <td colSpan={7}>
                   <div className="empty-state">
                     <div className="empty-state__icon">📋</div>
                     No jobs submitted yet. Use the Job Management form to submit a job.
@@ -109,6 +111,7 @@ export default function JobsTable({ jobs = [], onComplete, onDispatch, batchMode
                     </span>
                   </td>
                   <td>{job.work_total ?? '—'}</td>
+                  <td>{job.work_completed ?? '—'}</td>
                   <td>{job.work_remaining ?? '—'}</td>
                   <td>{job.priority ?? '—'}</td>
                   <td>

@@ -135,6 +135,46 @@ export async function fetchSnapshot() {
   }
 }
 
+/** GET /simulation/execution — read the backend runner state. */
+export async function fetchExecutionStatus() {
+  try {
+    const res = await fetch('/simulation/execution')
+    return handleResponse(res)
+  } catch {
+    return { ok: false, error: 'API unreachable' }
+  }
+}
+
+/** POST /simulation/run — start or resume automatic execution. */
+export async function runSimulation() {
+  try {
+    const res = await fetch('/simulation/run', { method: 'POST' })
+    return handleResponse(res)
+  } catch {
+    return { ok: false, error: 'API unreachable' }
+  }
+}
+
+/** POST /simulation/pause — stop automatic execution safely. */
+export async function pauseSimulation() {
+  try {
+    const res = await fetch('/simulation/pause', { method: 'POST' })
+    return handleResponse(res)
+  } catch {
+    return { ok: false, error: 'API unreachable' }
+  }
+}
+
+/** POST /simulation/step — advance once without batch continuation. */
+export async function stepSimulation() {
+  try {
+    const res = await fetch('/simulation/step', { method: 'POST' })
+    return handleResponse(res)
+  } catch {
+    return { ok: false, error: 'API unreachable' }
+  }
+}
+
 /**
  * GET /inventory — PostgreSQL-backed physical resource inventory.
  * Returns { terminals, berths, cranes } from the database.

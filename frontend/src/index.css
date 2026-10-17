@@ -436,6 +436,58 @@ body {
   font-size: var(--text-xs);
 }
 
+/* ── Simulation execution controls ─────────────────────────────────────── */
+.execution-controls__header {
+  justify-content: space-between;
+}
+
+.execution-controls__body {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+  flex-wrap: wrap;
+}
+
+.execution-controls__actions {
+  display: flex;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+
+.execution-controls__hint {
+  color: var(--clr-text-muted);
+  font-size: var(--text-xs);
+}
+
+.execution-status {
+  padding: 2px var(--space-3);
+  border-radius: 999px;
+  font-size: var(--text-xs);
+  font-weight: var(--fw-semi);
+  letter-spacing: 0.04em;
+}
+
+.execution-status--running {
+  background: var(--clr-badge-active);
+  color: var(--clr-badge-active-t);
+}
+
+.execution-status--paused {
+  background: var(--clr-badge-pending);
+  color: var(--clr-badge-pending-t);
+}
+
+.execution-status--completed {
+  background: var(--clr-badge-completed);
+  color: var(--clr-badge-completed-t);
+}
+
+.execution-status--blocked {
+  background: var(--clr-badge-failed);
+  color: var(--clr-badge-failed-t);
+}
+
 /* ── Section Headings ────────────────────────── */
 .section-title {
   font-size: var(--text-sm);

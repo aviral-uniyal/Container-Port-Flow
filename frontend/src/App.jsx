@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import StatusBar        from './components/StatusBar'
 import SimulationSetup  from './components/SimulationSetup'
 import ResourceSummary  from './components/ResourceSummary'
@@ -18,6 +18,10 @@ import {
   recoverCrane,
   reconcileState,
   dispatchBatch,
+  fetchExecutionStatus,
+  runSimulation,
+  pauseSimulation,
+  stepSimulation,
 } from './api'
 
 /**
@@ -47,6 +51,15 @@ export default function App() {
   // batchMode mirrors the C++ dispatcher's batch_mode flag set during init.
   // When true the dashboard shows the "Dispatch All" button.
   const [batchMode,        setBatchMode]        = useState(false)
+  const [execution,        setExecution]        = useState({
+    state: 'paused',
+    interval_seconds: 1,
+    error: null,
+  })
+  const snapshotRequestRef = useRef(0)
+  const executionRequestRef = useRef(0)
+  const executionStateRef = useRef('paused')
+  const runRequestRef = useRef(false)
 
   /* ── Helper: set loading flag for a given action key ── */
   function setBusy(key, busy) {
@@ -73,17 +86,72 @@ export default function App() {
         assigned_job_id: c.assigned_job || null,
       })))
     }
+    if (typeof data.batch_mode === 'boolean') {
+      setBatchMode(data.batch_mode)
+    }
   }, [])
 
   /* ── Refresh snapshot from backend ── */
   const refreshSnapshot = useCallback(async () => {
+    const requestId = ++snapshotRequestRef.current
     const result = await fetchSnapshot()
-    if (result.ok) {
+    if (result.ok && requestId === snapshotRequestRef.current) {
       applySnapshot(result.data)
     }
     // Silently ignore snapshot errors — the caller decides feedback
     return result
   }, [applySnapshot])
+
+  /* ── Refresh backend-owned execution status ── */
+  const refreshExecution = useCallback(async ({ announce = false } = {}) => {
+    const requestId = ++executionRequestRef.current
+    const result = await fetchExecutionStatus()
+    if (!result.ok || requestId !== executionRequestRef.current) return result
+
+    const previousState = executionStateRef.current
+    const nextState = result.data.state
+    executionStateRef.current = nextState
+    setExecution(result.data)
+
+    if (announce && nextState !== previousState) {
+      if (nextState === 'completed') {
+        setFeedback({ message: 'Automatic execution completed all jobs.', severity: 'ok' })
+      } else if (nextState === 'blocked') {
+        const detail = result.data.error ? ` ${result.data.error}` : ''
+        setFeedback({
+          message: `Execution is blocked by unavailable resources or interrupted work.${detail}`,
+          severity: 'warn',
+        })
+      }
+    }
+    return result
+  }, [])
+
+  /* ── Poll only while the backend reports RUNNING ── */
+  useEffect(() => {
+    if (execution.state !== 'running') return undefined
+
+    let cancelled = false
+    let timerId
+    async function poll() {
+      await refreshSnapshot()
+      if (cancelled) return
+      const statusResult = await refreshExecution({ announce: true })
+      if (cancelled) return
+      if (statusResult.ok && statusResult.data.state === 'running') {
+        timerId = window.setTimeout(poll, 1000)
+      } else if (!statusResult.ok) {
+        setFeedback({ message: `Execution status refresh failed: ${statusResult.error}`, severity: 'err' })
+        timerId = window.setTimeout(poll, 1000)
+      }
+    }
+
+    timerId = window.setTimeout(poll, 1000)
+    return () => {
+      cancelled = true
+      window.clearTimeout(timerId)
+    }
+  }, [execution.state, refreshExecution, refreshSnapshot])
 
   /* ── Refresh PostgreSQL inventory ── */
   const refreshInventory = useCallback(async () => {
@@ -124,13 +192,13 @@ export default function App() {
       }
       // Try loading initial snapshot if bridge is alive
       if (h.bridge_alive) {
-        await refreshSnapshot()
+        await Promise.all([refreshSnapshot(), refreshExecution()])
       }
       // Always attempt inventory; endpoint returns 503 gracefully when DB is down
       await refreshInventory()
     }
     checkHealth()
-  }, [refreshSnapshot, refreshInventory])
+  }, [refreshSnapshot, refreshInventory, refreshExecution])
 
   /* ── Initialize simulation ── */
   async function handleInit(formData) {
@@ -151,8 +219,60 @@ export default function App() {
       severity: 'ok',
     })
     setLastFailResult(null)
-    await refreshSnapshot()
+    await Promise.all([refreshSnapshot(), refreshExecution()])
     await refreshInventory()
+  }
+
+  /* ── Automatic execution controls ── */
+  async function handleRun() {
+    if (executionStateRef.current === 'running' || runRequestRef.current) return
+    runRequestRef.current = true
+    setBusy('run', true)
+    const result = await runSimulation()
+    runRequestRef.current = false
+    setBusy('run', false)
+    if (!result.ok) {
+      setFeedback({ message: `Run failed: ${result.error}`, severity: 'err' })
+      return
+    }
+    executionRequestRef.current += 1
+    executionStateRef.current = result.data.state
+    setExecution(result.data)
+    setFeedback({ message: 'Automatic execution started or resumed.', severity: 'ok' })
+    await refreshSnapshot()
+  }
+
+  async function handlePause() {
+    setBusy('pause', true)
+    const result = await pauseSimulation()
+    setBusy('pause', false)
+    if (!result.ok) {
+      setFeedback({ message: `Pause failed: ${result.error}`, severity: 'err' })
+      return
+    }
+    executionRequestRef.current += 1
+    executionStateRef.current = result.data.state
+    setExecution(result.data)
+    setFeedback({ message: 'Automatic execution paused.', severity: 'ok' })
+    await refreshSnapshot()
+  }
+
+  async function handleStep() {
+    setBusy('step', true)
+    const result = await stepSimulation()
+    setBusy('step', false)
+    if (!result.ok) {
+      setFeedback({ message: `Step failed: ${result.error}`, severity: 'err' })
+      return
+    }
+    const completed = result.data.completed_jobs ?? []
+    setFeedback({
+      message: completed.length > 0
+        ? `Single Step completed. Finished: ${completed.join(', ')}.`
+        : 'Single Step completed.',
+      severity: 'ok',
+    })
+    await Promise.all([refreshSnapshot(), refreshExecution()])
   }
 
   /* ── Dispatch all queued jobs (batch mode only) ── */
@@ -173,6 +293,7 @@ export default function App() {
       severity: count > 0 ? 'ok' : 'warn',
     })
     await refreshSnapshot()
+    await refreshExecution({ announce: true })
     await refreshInventory()
   }
 
@@ -190,6 +311,7 @@ export default function App() {
       severity: 'ok',
     })
     await refreshSnapshot()
+    await refreshExecution({ announce: true })
     await refreshInventory()
   }
 
@@ -253,6 +375,7 @@ export default function App() {
       setFeedback({ message: msg, severity: 'ok' })
     }
     await refreshSnapshot()
+    await refreshExecution({ announce: true })
     await refreshInventory()
   }
 
@@ -278,6 +401,7 @@ export default function App() {
       setFeedback({ message: msg, severity: 'ok' })
     }
     await refreshSnapshot()
+    await refreshExecution({ announce: true })
     await refreshInventory()
   }
 
@@ -352,6 +476,47 @@ export default function App() {
 
         {/* Resource Summary — full width */}
         <ResourceSummary resources={resources} />
+
+        {/* Execution controls — backend status is authoritative */}
+        <section className="card execution-controls" aria-labelledby="execution-controls-title">
+          <div className="card__header execution-controls__header">
+            <h2 className="card__title" id="execution-controls-title">Simulation Execution</h2>
+            <span className={`execution-status execution-status--${execution.state}`} role="status">
+              {execution.state.toUpperCase()}
+            </span>
+          </div>
+          <div className="card__body execution-controls__body">
+            <div className="execution-controls__actions">
+              <button
+                id="btn-run-simulation"
+                className="btn btn--primary"
+                onClick={handleRun}
+                disabled={execution.state === 'running' || loading.run || loading.pause || loading.step}
+              >
+                {loading.run ? 'Starting…' : '▶ Run'}
+              </button>
+              <button
+                id="btn-pause-simulation"
+                className="btn btn--outline"
+                onClick={handlePause}
+                disabled={execution.state !== 'running' || loading.pause}
+              >
+                {loading.pause ? 'Pausing…' : 'Ⅱ Pause'}
+              </button>
+              <button
+                id="btn-step-simulation"
+                className="btn btn--outline"
+                onClick={handleStep}
+                disabled={execution.state === 'running' || loading.step || loading.run || loading.pause}
+              >
+                {loading.step ? 'Stepping…' : 'Step +1'}
+              </button>
+            </div>
+            <span className="execution-controls__hint">
+              Work progress comes from the C++ dispatcher. Run advances about once per second.
+            </span>
+          </div>
+        </section>
 
         {/* Two-column: Setup left, Job form right */}
         <div className="app-main__two-col">
