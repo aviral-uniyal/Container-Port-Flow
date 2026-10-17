@@ -7,6 +7,12 @@ import JobsTable        from './components/JobsTable'
 import CraneRegistry    from './components/CraneRegistry'
 import DatabaseInventory from './components/DatabaseInventory'
 import {
+  dispatchFeedback,
+  executionStatusLabel,
+  stabilizeJobOrder,
+  stepFeedback,
+} from './uiLogic'
+import {
   fetchHealth,
   fetchInventory,
   initSimulation,
@@ -52,14 +58,15 @@ export default function App() {
   // When true the dashboard shows the "Dispatch All" button.
   const [batchMode,        setBatchMode]        = useState(false)
   const [execution,        setExecution]        = useState({
-    state: 'paused',
+    state: 'not_running',
     interval_seconds: 1,
     error: null,
   })
   const snapshotRequestRef = useRef(0)
   const executionRequestRef = useRef(0)
-  const executionStateRef = useRef('paused')
+  const executionStateRef = useRef('not_running')
   const runRequestRef = useRef(false)
+  const jobOrderRef = useRef([])
 
   /* ── Helper: set loading flag for a given action key ── */
   function setBusy(key, busy) {
@@ -77,7 +84,9 @@ export default function App() {
       })
     }
     if (Array.isArray(data.jobs)) {
-      setJobs(data.jobs)
+      const ordered = stabilizeJobOrder(data.jobs, jobOrderRef.current)
+      jobOrderRef.current = ordered.order
+      setJobs(ordered.jobs)
     }
     if (Array.isArray(data.cranes)) {
       setCranes(data.cranes.map(c => ({
@@ -219,6 +228,7 @@ export default function App() {
       severity: 'ok',
     })
     setLastFailResult(null)
+    jobOrderRef.current = []
     await Promise.all([refreshSnapshot(), refreshExecution()])
     await refreshInventory()
   }
@@ -265,14 +275,9 @@ export default function App() {
       setFeedback({ message: `Step failed: ${result.error}`, severity: 'err' })
       return
     }
-    const completed = result.data.completed_jobs ?? []
-    setFeedback({
-      message: completed.length > 0
-        ? `Single Step completed. Finished: ${completed.join(', ')}.`
-        : 'Single Step completed.',
-      severity: 'ok',
-    })
-    await Promise.all([refreshSnapshot(), refreshExecution()])
+    const [snapshotResult] = await Promise.all([refreshSnapshot(), refreshExecution()])
+    const snapshotJobs = snapshotResult.ok ? (snapshotResult.data.jobs ?? []) : jobs
+    setFeedback(stepFeedback(result.data, snapshotJobs, batchMode))
   }
 
   /* ── Dispatch all queued jobs (batch mode only) ── */
@@ -285,14 +290,11 @@ export default function App() {
       return
     }
     const count = result.data.count ?? 0
-    const ids   = (result.data.dispatched_jobs ?? []).join(', ')
-    setFeedback({
-      message: count > 0
-        ? `Dispatched ${count} job${count !== 1 ? 's' : ''}: ${ids}.`
-        : 'Dispatch All ran — no eligible jobs were waiting.',
-      severity: count > 0 ? 'ok' : 'warn',
-    })
-    await refreshSnapshot()
+    const dispatchedJobs = result.data.dispatched_jobs ?? []
+    const snapshotResult = await refreshSnapshot()
+    const pendingJobs = (snapshotResult.ok ? snapshotResult.data.jobs ?? [] : jobs)
+      .filter(job => job.state === 'PENDING').length
+    setFeedback(dispatchFeedback({ count, dispatchedJobs, pendingJobs }))
     await refreshExecution({ announce: true })
     await refreshInventory()
   }
@@ -470,19 +472,31 @@ export default function App() {
         <StatusBar
           connectionStatus={connectionStatus}
           healthDetail={healthDetail}
-          message={feedback?.message}
-          messageSeverity={feedback?.severity}
         />
 
         {/* Resource Summary — full width */}
         <ResourceSummary resources={resources} />
+
+        <section
+          className={`operational-feedback operational-feedback--${feedback?.severity ?? 'neutral'}`}
+          role="status"
+          aria-live="polite"
+        >
+          <span className="operational-feedback__label">Operational feedback</span>
+          <span>{feedback?.message ?? 'No operations performed yet.'}</span>
+        </section>
+
+        <div className="app-main__two-col">
+          <SimulationSetup onSubmit={handleInit} disabled={loading.init} />
+          <JobForm onSubmit={handleJobSubmit} disabled={loading.job} />
+        </div>
 
         {/* Execution controls — backend status is authoritative */}
         <section className="card execution-controls" aria-labelledby="execution-controls-title">
           <div className="card__header execution-controls__header">
             <h2 className="card__title" id="execution-controls-title">Simulation Execution</h2>
             <span className={`execution-status execution-status--${execution.state}`} role="status">
-              {execution.state.toUpperCase()}
+              {executionStatusLabel(execution.state)}
             </span>
           </div>
           <div className="card__body execution-controls__body">
@@ -517,12 +531,6 @@ export default function App() {
             </span>
           </div>
         </section>
-
-        {/* Two-column: Setup left, Job form right */}
-        <div className="app-main__two-col">
-          <SimulationSetup onSubmit={handleInit} disabled={loading.init} />
-          <JobForm onSubmit={handleJobSubmit} disabled={loading.job} />
-        </div>
 
         {/* Jobs Table — full width */}
         <JobsTable

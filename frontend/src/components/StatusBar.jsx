@@ -1,10 +1,5 @@
-/**
- * StatusBar — shows backend connection status and the most recent operation
- * feedback message. Accepts `connectionStatus` ('ok' | 'warn' | 'err' | 'neutral'),
- * an optional `healthDetail` object with { bridge_alive, db_connected },
- * and an optional `message` string with a severity ('ok' | 'warn' | 'err' | null).
- */
-export default function StatusBar({ connectionStatus, healthDetail, message, messageSeverity }) {
+/** StatusBar shows only backend, C++ bridge, and database connection health. */
+export default function StatusBar({ connectionStatus, healthDetail }) {
   const dotClass = {
     ok:      'status-dot--ok',
     warn:    'status-dot--warn',
@@ -19,12 +14,8 @@ export default function StatusBar({ connectionStatus, healthDetail, message, mes
     neutral: 'Not connected',
   }[connectionStatus] ?? 'Unknown'
 
-  const msgClass = messageSeverity
-    ? `status-area__message status-area__message--${messageSeverity}`
-    : 'status-area__message'
-
   return (
-    <div className="status-area" role="status" aria-live="polite">
+    <div className="status-area" role="status" aria-label="Connection status">
       <div className="status-area__indicator">
         <span className={`status-dot ${dotClass}`} aria-hidden="true" />
         <span>{connectionLabel}</span>
@@ -46,15 +37,6 @@ export default function StatusBar({ connectionStatus, healthDetail, message, mes
         </div>
       )}
 
-      {message && (
-        <p className={msgClass}>{message}</p>
-      )}
-
-      {!message && (
-        <p className="status-area__message">
-          No operations performed yet.
-        </p>
-      )}
     </div>
   )
 }

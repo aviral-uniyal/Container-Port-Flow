@@ -743,7 +743,12 @@ def _simulation_crane_fail_sync(crane_id: str, request: Request):
 async def simulation_crane_recover(crane_id: str, request: Request):
     execution = _get_execution(request)
     async with execution.lock:
-        return await asyncio.to_thread(_simulation_crane_recover_sync, crane_id, request)
+        result = await asyncio.to_thread(_simulation_crane_recover_sync, crane_id, request)
+    status = await execution.resume_after_recovery(
+        can_progress=bool(result.get("job_dispatched")),
+    )
+    result["execution_state"] = status["state"]
+    return result
 
 
 def _simulation_crane_recover_sync(crane_id: str, request: Request):

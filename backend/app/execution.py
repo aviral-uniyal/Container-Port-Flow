@@ -20,10 +20,12 @@ class SimulationExecution:
         self.transition_lock = asyncio.Lock()
         self.task: asyncio.Task[None] | None = None
         self.stop = asyncio.Event()
-        self.state = "paused"
+        self.state = "not_running"
         self.error: str | None = None
         self.interval = 1.0
         self.on_snapshot = None
+        self._run_requested = False
+        self._recoverable_block = False
 
     def status(self) -> dict[str, Any]:
         return {"state": self.state, "interval_seconds": self.interval,
@@ -54,11 +56,17 @@ class SimulationExecution:
 
     async def run(self, interval: float) -> dict[str, Any]:
         async with self.transition_lock:
+            previous_task = self.task
+            if (self.state != "running" and previous_task is not None
+                    and not previous_task.done()):
+                await previous_task
             async with self.lock:
                 if self.state == "running":
                     return self.status()
                 self.interval = interval
                 self.error = None
+                self._run_requested = True
+                self._recoverable_block = False
                 self.stop = asyncio.Event()
                 self.state = "running"
                 self.task = asyncio.create_task(self._loop(), name="simulation-runner")
@@ -66,12 +74,39 @@ class SimulationExecution:
 
     async def pause(self) -> dict[str, Any]:
         async with self.transition_lock:
+            self._run_requested = False
+            self._recoverable_block = False
             await self._stop_runner()
             return self.status()
+
+    async def resume_after_recovery(self, can_progress: bool) -> dict[str, Any]:
+        """Restart only a recoverably blocked runner whose Run intent remains set."""
+        async with self.transition_lock:
+            previous_task = self.task
+            if (self.state == "blocked" and previous_task is not None
+                    and not previous_task.done()):
+                await previous_task
+            async with self.lock:
+                should_resume = (
+                    can_progress
+                    and self.state == "blocked"
+                    and self._run_requested
+                    and self._recoverable_block
+                    and self.error is None
+                )
+                if not should_resume:
+                    return self.status()
+                self.stop = asyncio.Event()
+                self.state = "running"
+                self._recoverable_block = False
+                self.task = asyncio.create_task(self._loop(), name="simulation-runner")
+                return self.status()
 
     async def reset(self, command: dict[str, Any], before_reset=None,
                     capture_snapshot=False) -> dict[str, Any]:
         async with self.transition_lock:
+            self._run_requested = False
+            self._recoverable_block = False
             await self._stop_runner()
             async with self.lock:
                 if before_reset is not None:
@@ -81,7 +116,7 @@ class SimulationExecution:
                                 if needs_snapshot else None)
                     await asyncio.to_thread(before_reset, snapshot)
                 response = await asyncio.to_thread(self._send, self.bridge, command)
-                self.state = "paused"
+                self.state = "not_running"
                 self.error = None
                 return response
 
@@ -117,9 +152,13 @@ class SimulationExecution:
                     )
                     if not unfinished:
                         self.state = "completed"
+                        self._run_requested = False
+                        self._recoverable_block = False
                         break
                     if not result.get("advanced_jobs") and not result.get("dispatched_jobs"):
                         self.state = "blocked"
+                        self.error = None
+                        self._recoverable_block = True
                         break
                 try:
                     await asyncio.wait_for(self.stop.wait(), timeout=self.interval)
@@ -129,6 +168,8 @@ class SimulationExecution:
             logger.error("Simulation runner failed: %s", exc)
             self.error = str(exc)
             self.state = "blocked"
+            self._run_requested = False
+            self._recoverable_block = False
         finally:
             if self.state == "running":
                 self.state = "paused"

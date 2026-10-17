@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import threading
 import time
@@ -132,6 +133,14 @@ def test_step_forwarding_and_batch_authorization():
         assert any(c == {"cmd": "step", "continue_batch": True} for c in bridge.commands)
 
 
+def test_initial_and_manual_step_status_are_not_running():
+    bridge = WorkBridge(work=(2,))
+    with client_for(bridge) as client:
+        assert client.get("/simulation/execution").json()["state"] == "not_running"
+        assert client.post("/simulation/step").status_code == 200
+        assert client.get("/simulation/execution").json()["state"] == "not_running"
+
+
 def test_pause_resume_and_duplicate_controls():
     bridge = WorkBridge(work=(8,))
     with client_for(bridge) as client:
@@ -162,10 +171,63 @@ def test_failure_recovery_and_immediate_continuation():
         assert failure_command["work_remaining"] == preserved
         wait_for(client, "blocked")
         assert bridge.jobs[0]["work_remaining"] == preserved
-        assert client.post("/simulation/cranes/C1/recover").status_code == 200
-        client.post("/simulation/run", json={"interval_seconds": 0.05})
+        recovery = client.post("/simulation/cranes/C1/recover")
+        assert recovery.status_code == 200
+        assert recovery.json()["execution_state"] == "running"
         wait_for(client, "completed")
         assert all(j["state"] == "COMPLETED" for j in bridge.jobs)
+
+
+def test_manual_pause_prevents_recovery_from_restarting_runner():
+    bridge = WorkBridge(work=(5,))
+    with client_for(bridge) as client:
+        client.post("/simulation/run", json={"interval_seconds": 0.1})
+        wait_for_work(bridge)
+        assert client.post("/simulation/pause").json()["state"] == "paused"
+        assert client.post("/simulation/cranes/C1/fail").status_code == 200
+        recovery = client.post("/simulation/cranes/C1/recover")
+        assert recovery.status_code == 200
+        assert recovery.json()["execution_state"] == "paused"
+        preserved = bridge.jobs[0]["work_remaining"]
+        time.sleep(0.15)
+        assert bridge.jobs[0]["work_remaining"] == preserved
+
+
+def test_blocked_runner_waits_until_recovery_can_make_progress():
+    bridge = WorkBridge(work=(3,))
+
+    async def scenario():
+        execution = SimulationExecution(bridge)
+        await execution.run(0.01)
+        while bridge.jobs[0]["work_completed"] == 0:
+            await asyncio.sleep(0.005)
+        bridge.send({"cmd": "crane_failed"})
+        while execution.state != "blocked":
+            await asyncio.sleep(0.005)
+        preserved = bridge.jobs[0]["work_remaining"]
+        assert (await execution.resume_after_recovery(False))["state"] == "blocked"
+        await asyncio.sleep(0.03)
+        assert bridge.jobs[0]["work_remaining"] == preserved
+        bridge.send({"cmd": "crane_recovered"})
+        assert (await execution.resume_after_recovery(True))["state"] == "running"
+        while execution.state != "completed":
+            await asyncio.sleep(0.005)
+
+    asyncio.run(scenario())
+    assert bridge.jobs[0]["state"] == "COMPLETED"
+
+
+def test_reset_clears_blocked_resume_intent():
+    bridge = WorkBridge(work=(5,))
+    with client_for(bridge) as client:
+        client.post("/simulation/run", json={"interval_seconds": 0.05})
+        wait_for_work(bridge)
+        assert client.post("/simulation/cranes/C1/fail").status_code == 200
+        wait_for(client, "blocked")
+        assert client.post("/simulation/init", json={
+            "berths": 1, "cranes": 1, "trucks": 0,
+        }).status_code == 200
+        assert client.get("/simulation/execution").json()["state"] == "not_running"
 
 
 def test_runner_error_and_reinitialization_stops_execution():
@@ -179,7 +241,7 @@ def test_runner_error_and_reinitialization_stops_execution():
         assert client.post("/simulation/init", json={
             "berths": 1, "cranes": 1, "trucks": 1, "policy": "FCFS"
         }).status_code == 200
-        assert client.get("/simulation/execution").json()["state"] == "paused"
+        assert client.get("/simulation/execution").json()["state"] == "not_running"
         count = len([c for c in bridge.commands if c["cmd"] == "step"])
         time.sleep(0.15)
         assert len([c for c in bridge.commands if c["cmd"] == "step"]) == count
