@@ -71,6 +71,7 @@ struct JobRecord {
     int         work_completed; // starts 0
     std::unordered_set<std::string> active_cranes;  // currently ASSIGNED crane IDs
     int         submission_seq; // monotonic counter for FCFS ordering
+    int         dispatch_seq;   // immutable first-dispatch order; -1 until selected
     bool        rm_allocated;   // true iff ResourceManager holds an allocation for this job
 };
 
@@ -323,6 +324,7 @@ private:
     bool auto_dispatch_ = true;
 
     int next_seq_ = 0;  // monotonic submission counter
+    int next_dispatch_seq_ = 0;  // monotonic first-dispatch counter
 
     // All known job records, keyed by job_id.
     std::unordered_map<std::string, JobRecord> job_records_;

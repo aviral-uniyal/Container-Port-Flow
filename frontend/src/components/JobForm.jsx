@@ -24,6 +24,10 @@ export function submittedShipSelection() {
   return { ship_id: null, query: '', open: false, activeIndex: -1 }
 }
 
+export function clearSubmittedShip(form) {
+  return { ...form, ship_id: null }
+}
+
 /**
  * JobForm — job-submission form using the exact API field names:
  *   ship_id, job_id, arrival_time, work_total, priority, berths, cranes, trucks.
@@ -77,7 +81,7 @@ export default function JobForm({ onSubmit, disabled, ships, inventoryLoading, i
 
   function resetShipAfterSubmit() {
     const reset = submittedShipSelection()
-    setForm(prev => ({ ...prev, ship_id: reset.ship_id }))
+    setForm(clearSubmittedShip)
     setShipQuery(reset.query)
     setShipOpen(reset.open)
     setActiveShipIndex(reset.activeIndex)
@@ -137,7 +141,7 @@ export default function JobForm({ onSubmit, disabled, ships, inventoryLoading, i
                 aria-activedescendant={shipOpen && choices[activeShipIndex] ? `job-ship-option-${choices[activeShipIndex].ship_id}` : undefined}
                 aria-required="true"
                 autoComplete="off"
-                placeholder="Search and select a ship"
+                placeholder="Select a ship"
                 value={shipQuery}
                 onChange={e => {
                   setShipQuery(e.target.value)

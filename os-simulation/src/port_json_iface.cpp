@@ -489,6 +489,10 @@ static void cmd_snapshot(const picojson::object& /*req*/) {
             jo["arrival_time"]    = picojson::value(static_cast<double>(rec.job.arrival_time));
             jo["priority"]        = picojson::value(static_cast<double>(rec.job.priority));
             jo["submission_seq"]  = picojson::value(static_cast<double>(rec.submission_seq));
+            if (rec.dispatch_seq >= 0) {
+                jo["dispatch_sequence"] = picojson::value(
+                    static_cast<double>(rec.dispatch_seq));
+            }
             auto qpos = queue_positions.find(jid);
             if (qpos != queue_positions.end()) {
                 jo["queue_position"] = picojson::value(static_cast<double>(qpos->second));

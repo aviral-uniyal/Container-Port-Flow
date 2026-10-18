@@ -1,7 +1,7 @@
 /**
  * JobsTable — shows submitted simulation jobs.
- * Columns: job ID, state, work total, work completed, work remaining,
- * priority, actions.
+ * Columns: job ID, state, crane supply, queue position, work total, work completed,
+ * work remaining, priority, actions.
  *
  * Props:
  *   jobs       — array of job objects. Empty array shows an empty-state row.
@@ -10,6 +10,17 @@
  *   batchMode  — boolean; when true shows the Dispatch All banner.
  *   loading    — object tracking in-flight request keys.
  */
+export function jobSupplyLabel(job) {
+  if (job.state !== 'ACTIVE' && job.state !== 'INTERRUPTED') return '—'
+
+  const fulfilled = job.crane_fulfilled !== undefined
+    ? job.crane_fulfilled
+    : job.can_complete !== undefined
+      ? job.can_complete
+      : (!job.required_cranes || !job.active_cranes || job.active_cranes.length >= job.required_cranes)
+  return fulfilled ? 'FULLY SUPPLIED' : 'UNDER-SUPPLIED'
+}
+
 export default function JobsTable({ jobs = [], onComplete, onDispatch, batchMode = false, loading = {} }) {
   const STATE_BADGE = {
     PENDING:     'badge badge--pending',
@@ -49,12 +60,18 @@ export default function JobsTable({ jobs = [], onComplete, onDispatch, batchMode
           </div>
         )}
       </div>
+      <p className="jobs-table__hint">
+        Queued jobs follow the selected scheduling policy. Rows retain first-dispatch order as job
+        states change. State and crane supply are shown separately.
+      </p>
       <div className="table-wrapper">
         <table className="table" aria-label="Simulation jobs list">
           <thead>
             <tr>
               <th scope="col">Job ID</th>
               <th scope="col">State</th>
+              <th scope="col">Crane Supply</th>
+              <th scope="col">Queue Position</th>
               <th scope="col">Work Total</th>
               <th scope="col">Work Completed</th>
               <th scope="col">Work Remaining</th>
@@ -65,7 +82,7 @@ export default function JobsTable({ jobs = [], onComplete, onDispatch, batchMode
           <tbody>
             {jobs.length === 0 ? (
               <tr>
-                <td colSpan={7}>
+                <td colSpan={9}>
                   <div className="empty-state">
                     <div className="empty-state__icon">📋</div>
                     No jobs submitted yet. Use the Job Management form to submit a job.
@@ -85,6 +102,23 @@ export default function JobsTable({ jobs = [], onComplete, onDispatch, batchMode
                       {job.state}
                     </span>
                   </td>
+                  <td>
+                    {jobSupplyLabel(job) === 'UNDER-SUPPLIED' ? (
+                      <span
+                        className="badge"
+                        style={{ background: '#fef3c7', color: '#92400e', fontSize: '0.6875rem' }}
+                        title="Job is missing one or more required cranes"
+                      >
+                        UNDER-SUPPLIED
+                      </span>
+                    ) : jobSupplyLabel(job)}
+                  </td>
+                  <td>
+                    {(job.state === 'PENDING' || job.state === 'INTERRUPTED') &&
+                      Number.isInteger(job.queue_position) && job.queue_position > 0
+                      ? job.queue_position
+                      : '—'}
+                  </td>
                   <td>{job.work_total ?? '—'}</td>
                   <td>{job.work_completed ?? '—'}</td>
                   <td>{job.work_remaining ?? '—'}</td>
@@ -94,9 +128,6 @@ export default function JobsTable({ jobs = [], onComplete, onDispatch, batchMode
                       const isEligible = job.can_complete !== undefined
                         ? job.can_complete
                         : (!job.required_cranes || !job.active_cranes || job.active_cranes.length >= job.required_cranes)
-                      const isUndersupplied = job.can_complete === false ||
-                        (job.required_cranes && job.active_cranes && job.active_cranes.length < job.required_cranes)
-
                       return (
                         <div style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem' }}>
                           <button
@@ -108,15 +139,6 @@ export default function JobsTable({ jobs = [], onComplete, onDispatch, batchMode
                           >
                             {loading[`complete-${job.job_id}`] ? 'Completing…' : 'Complete'}
                           </button>
-                          {isUndersupplied && (
-                            <span
-                              className="badge"
-                              style={{ background: '#fef3c7', color: '#92400e', fontSize: '0.6875rem' }}
-                              title="Job is missing one or more required cranes"
-                            >
-                              undersupplied
-                            </span>
-                          )}
                         </div>
                       )
                     })()}

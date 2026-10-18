@@ -144,7 +144,10 @@ class SimulationExecution:
                         self._send, self.bridge, {"cmd": "snapshot"},
                     )
                     if self.on_snapshot is not None:
-                        await asyncio.to_thread(self.on_snapshot, snapshot)
+                        try:
+                            await asyncio.to_thread(self.on_snapshot, snapshot)
+                        except Exception as exc:
+                            raise SimulationPersistenceError(str(exc)) from exc
                     jobs = snapshot.get("jobs", [])
                     unfinished = any(
                         job.get("state") in ("PENDING", "ACTIVE", "INTERRUPTED")
@@ -164,6 +167,12 @@ class SimulationExecution:
                     await asyncio.wait_for(self.stop.wait(), timeout=self.interval)
                 except asyncio.TimeoutError:
                     pass
+        except SimulationPersistenceError as exc:
+            logger.error("Simulation persistence failed: %s", exc)
+            self.error = f"Database persistence failed; reconciliation required: {exc}"
+            self.state = "blocked"
+            self._run_requested = False
+            self._recoverable_block = False
         except Exception as exc:
             logger.error("Simulation runner failed: %s", exc)
             self.error = str(exc)

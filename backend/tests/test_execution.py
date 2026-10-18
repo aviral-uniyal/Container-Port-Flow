@@ -290,8 +290,11 @@ def test_runner_blocks_when_database_persistence_fails():
         client.app.state.current_run_id = 7
         assert client.post("/simulation/run", json={"interval_seconds": 0.05}).status_code == 200
         status = wait_for(client, "blocked")
+        assert "Database persistence failed; reconciliation required" in status["error"]
         assert "Database unavailable" in status["error"]
         assert bridge.jobs[0]["work_completed"] == 1
+        assert client.app.state.execution._recoverable_block is False
+        assert client.app.state.execution._run_requested is False
 
 
 def test_reset_waits_for_active_runner_before_database_reconciliation():
@@ -304,7 +307,8 @@ def test_reset_waits_for_active_runner_before_database_reconciliation():
              patch("backend.app.router.get_active_assignments_for_run", return_value=[]), \
              patch("backend.app.router.cancel_unfinished_jobs_for_run") as cancel, \
              patch("backend.app.router.release_active_assignments_for_run"), \
-             patch("backend.app.router.make_assigned_cranes_available"), \
+             patch("backend.app.router.batch_sync_crane_statuses",
+                   side_effect=lambda conn, statuses: len(statuses)), \
              patch("backend.app.router.close_simulation_run"), \
              patch("backend.app.router.insert_simulation_run", return_value=8):
             assert client.post("/simulation/run", json={"interval_seconds": 0.05}).status_code == 200

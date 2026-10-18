@@ -20,10 +20,12 @@ let matchingShips
 let selectableShips
 let nextShipIndex
 let submittedShipSelection
+let clearSubmittedShip
 
 before(async () => {
   server = await createServer({ server: { middlewareMode: true }, appType: 'custom' })
-  ;({ default: JobForm, matchingShips, selectableShips, nextShipIndex, submittedShipSelection } =
+  ;({ default: JobForm, clearSubmittedShip, matchingShips, selectableShips,
+    nextShipIndex, submittedShipSelection } =
     await server.ssrLoadModule('/src/components/JobForm.jsx'))
   ;({ default: DatabaseInventory, filterInventoryShips } =
     await server.ssrLoadModule('/src/components/DatabaseInventory.jsx'))
@@ -56,6 +58,15 @@ test('successful submission resets selection without reopening the dropdown', as
   const source = await readFile(new URL('../src/components/JobForm.jsx', import.meta.url), 'utf8')
   assert.match(source, /if \(submitted\) resetShipAfterSubmit\(\)/)
   assert.match(source, /function resetShipAfterSubmit\(\)[\s\S]*?shipSearchRef\.current\?\.blur\(\)/)
+  assert.match(source, /placeholder="Select a ship"/)
+  assert.deepEqual(clearSubmittedShip({
+    ship_id: 11, job_id: 'J1', work_total: 8, priority: 2,
+  }), {
+    ship_id: null, job_id: 'J1', work_total: 8, priority: 2,
+  })
+
+  const appSource = await readFile(new URL('../src/App.jsx', import.meta.url), 'utf8')
+  assert.match(appSource, /void Promise\.all\([\s\S]*?refreshInventory\(\)[\s\S]*?return true/)
 })
 
 test('ship selector is required before submission and supports keyboard and clearing', async () => {
@@ -64,7 +75,7 @@ test('ship selector is required before submission and supports keyboard and clea
   }))
   assert.match(html, /role="combobox"/)
   assert.match(html, /aria-required="true"/)
-  assert.match(html, /Search and select a ship/)
+  assert.match(html, /Select a ship/)
   assert.match(html, /Each ship can have one job per run/)
   assert.match(html, /id="btn-submit-job"[^>]*disabled=""/)
   const css = await readFile(new URL('../src/index.css', import.meta.url), 'utf8')

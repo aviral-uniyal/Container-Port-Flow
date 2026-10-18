@@ -37,13 +37,13 @@ from .database import (
     insert_disruption_event,
     insert_simulation_job,
     insert_simulation_run,
-    make_assigned_cranes_available,
     release_active_assignments_for_run,
     release_active_crane_assignments_by_job,
     release_crane_assignment,
     ship_exists,
     ship_has_job_in_run,
     update_crane_status,
+    update_job_dispatch_sequence,
     update_job_status,
     update_job_work_progress,
 )
@@ -191,6 +191,18 @@ def _persist_snapshot(request: Request, snap: dict[str, Any], conn=None) -> dict
             previous = persisted_jobs.get(jid)
             if previous is None:
                 raise RuntimeError(f"Job {jid} is missing from run {run_id} in PostgreSQL")
+            dispatch_sequence = job.get("dispatch_sequence")
+            if dispatch_sequence is not None:
+                if (not isinstance(dispatch_sequence, int) or isinstance(dispatch_sequence, bool)
+                        or dispatch_sequence < 0):
+                    raise RuntimeError(f"Invalid dispatch sequence for job {jid}")
+                previous_sequence = previous.get("dispatch_sequence")
+                if previous_sequence is not None and previous_sequence != dispatch_sequence:
+                    raise RuntimeError(f"Dispatch sequence changed for job {jid}")
+                if (previous_sequence is None and not update_job_dispatch_sequence(
+                        conn, run_id=run_id, job_id=jid,
+                        dispatch_sequence=dispatch_sequence)):
+                    raise RuntimeError(f"Could not persist dispatch sequence for job {jid}")
             state = job["state"]
             if state != previous["status"]:
                 update_job_status(conn, run_id=run_id, job_id=jid, status=state)
@@ -299,20 +311,15 @@ async def simulation_init(body: InitRequest, request: Request):
         with get_connection(pool) as conn:
             if previous_run_id is not None:
                 assignments = get_active_assignments_for_run(conn, previous_run_id)
-                assigned_ids = {c["crane_id"] for c in snapshot["cranes"]
-                                if c["status"] == "ASSIGNED"}
-                assigned_ids.update(a["crane_id"] for a in assignments)
-                failed_ids = {c["crane_id"] for c in snapshot["cranes"]
-                              if c["status"] == "FAILED"}
-                assigned_ids.difference_update(failed_ids)
+                reset_ids = {c["crane_id"] for c in snapshot["cranes"]}
+                reset_ids.update(a["crane_id"] for a in assignments)
                 cancel_unfinished_jobs_for_run(conn, previous_run_id)
                 release_active_assignments_for_run(conn, previous_run_id, "SIMULATION_RESET")
-                make_assigned_cranes_available(conn, sorted(assigned_ids))
-                if failed_ids:
-                    failed_statuses = [{"crane_id": cid, "status": "FAILED"}
-                                       for cid in sorted(failed_ids)]
-                    if batch_sync_crane_statuses(conn, failed_statuses) != len(failed_statuses):
-                        raise RuntimeError("A failed runtime crane is missing from inventory")
+                reset_statuses = [{"crane_id": cid, "status": "AVAILABLE"}
+                                  for cid in sorted(reset_ids)]
+                if (reset_statuses and
+                        batch_sync_crane_statuses(conn, reset_statuses) != len(reset_statuses)):
+                    raise RuntimeError("A previous runtime crane is missing from inventory")
                 terminal = ("COMPLETED" if snapshot["jobs"] and all(
                     job["state"] in ("COMPLETED", "CANCELLED")
                     for job in snapshot["jobs"]) else "FAILED")

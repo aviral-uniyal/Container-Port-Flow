@@ -14,7 +14,8 @@ PortDispatcher::PortDispatcher(int total_berths,
       registry_(),
       dm_(registry_),
       policy_(policy),
-      next_seq_(0)
+      next_seq_(0),
+      next_dispatch_seq_(0)
 {
     // ResourceManager constructor already validates negative capacities.
 }
@@ -179,6 +180,9 @@ std::string PortDispatcher::try_dispatch_interrupted() {
             rec.active_cranes.insert(crane_id);
         }
         rec.state = JobState::ACTIVE;
+        if (rec.dispatch_seq < 0) {
+            rec.dispatch_seq = next_dispatch_seq_++;
+        }
 
         // Remove from pending queue.
         pending_queue_.erase(pending_queue_.begin() + static_cast<int>(qi));
@@ -219,6 +223,9 @@ std::string PortDispatcher::try_dispatch_pending() {
         }
 
         rec.state        = JobState::ACTIVE;
+        if (rec.dispatch_seq < 0) {
+            rec.dispatch_seq = next_dispatch_seq_++;
+        }
         rec.rm_allocated = true;
 
         // Remove from pending queue.
@@ -276,6 +283,7 @@ void PortDispatcher::submit_job(const PortJob& job) {
     rec.work_remaining = job.work_total;
     rec.work_completed = 0;
     rec.submission_seq = next_seq_++;
+    rec.dispatch_seq   = -1;
     rec.rm_allocated   = false;
 
     job_records_.emplace(job.job_id, std::move(rec));

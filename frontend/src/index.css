@@ -414,6 +414,14 @@ body {
   overflow-x: auto;
 }
 
+.jobs-table__hint {
+  margin: 0;
+  padding: var(--space-2) var(--space-5);
+  color: var(--clr-text-muted);
+  font-size: var(--text-xs);
+  border-bottom: 1px solid var(--clr-border);
+}
+
 .table {
   width: 100%;
   border-collapse: collapse;

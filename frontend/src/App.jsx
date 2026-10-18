@@ -7,6 +7,7 @@ import JobsTable        from './components/JobsTable'
 import CraneRegistry    from './components/CraneRegistry'
 import DatabaseInventory from './components/DatabaseInventory'
 import {
+  blockedExecutionFeedback,
   dispatchFeedback,
   executionStatusLabel,
   stabilizeJobOrder,
@@ -65,7 +66,6 @@ export default function App() {
   const executionRequestRef = useRef(0)
   const executionStateRef = useRef('not_running')
   const runRequestRef = useRef(false)
-  const jobOrderRef = useRef([])
 
   /* ── Helper: set loading flag for a given action key ── */
   function setBusy(key, busy) {
@@ -83,9 +83,7 @@ export default function App() {
       })
     }
     if (Array.isArray(data.jobs)) {
-      const ordered = stabilizeJobOrder(data.jobs, jobOrderRef.current)
-      jobOrderRef.current = ordered.order
-      setJobs(ordered.jobs)
+      setJobs(stabilizeJobOrder(data.jobs).jobs)
     }
     if (Array.isArray(data.cranes)) {
       setCranes(data.cranes.map(c => ({
@@ -125,11 +123,7 @@ export default function App() {
       if (nextState === 'completed') {
         setFeedback({ message: 'Automatic execution completed all jobs.', severity: 'ok' })
       } else if (nextState === 'blocked') {
-        const detail = result.data.error ? ` ${result.data.error}` : ''
-        setFeedback({
-          message: `Execution is blocked by unavailable resources or interrupted work.${detail}`,
-          severity: 'warn',
-        })
+        setFeedback(blockedExecutionFeedback(result.data.error))
       }
     }
     return result
@@ -230,7 +224,6 @@ export default function App() {
       severity: 'ok',
     })
     setLastFailResult(null)
-    jobOrderRef.current = []
     await Promise.all([refreshSnapshot(), refreshExecution()])
     await refreshInventory()
   }
@@ -319,9 +312,13 @@ export default function App() {
       message: `Job "${formData.job_id}" submitted successfully.`,
       severity: 'ok',
     })
-    await refreshSnapshot()
-    await refreshExecution({ announce: true })
-    await refreshInventory()
+    // The submit itself has succeeded, so let JobForm clear only its ship
+    // selection immediately. These independent refreshes can finish afterward.
+    void Promise.all([
+      refreshSnapshot(),
+      refreshExecution({ announce: true }),
+      refreshInventory(),
+    ])
     return true
   }
 

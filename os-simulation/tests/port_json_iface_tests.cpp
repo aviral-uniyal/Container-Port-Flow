@@ -424,6 +424,9 @@ private:
                 jo["arrival_time"]   = picojson::value((double)rec.job.arrival_time);
                 jo["priority"]       = picojson::value((double)rec.job.priority);
                 jo["submission_seq"] = picojson::value((double)rec.submission_seq);
+                if (rec.dispatch_seq >= 0) {
+                    jo["dispatch_sequence"] = picojson::value((double)rec.dispatch_seq);
+                }
                 auto qpos = queue_positions.find(jid);
                 if (qpos != queue_positions.end()) {
                     jo["queue_position"] = picojson::value((double)qpos->second);
@@ -1212,6 +1215,8 @@ static bool t_snapshot_multiple_jobs_metadata() {
 static bool t_snapshot_queue_order_is_authoritative_and_deterministic() {
     AdapterSim sim;
     sim.dispatch(R"({"cmd":"init","berths":2,"cranes":2,"trucks":2,"policy":"SJF","batch_mode":true})");
+    sim.dispatch(R"({"cmd":"register_crane","crane_id":"C1"})");
+    sim.dispatch(R"({"cmd":"register_crane","crane_id":"C2"})");
     sim.dispatch(R"({"cmd":"submit_job","job_id":"LONG","arrival_time":99,"work_total":30,"priority":5,"berths":1,"cranes":1,"trucks":1})");
     sim.dispatch(R"({"cmd":"submit_job","job_id":"SHORT_A","arrival_time":0,"work_total":10,"priority":5,"berths":1,"cranes":1,"trucks":1})");
     sim.dispatch(R"({"cmd":"submit_job","job_id":"SHORT_B","arrival_time":1,"work_total":10,"priority":1,"berths":1,"cranes":1,"trucks":1})");
@@ -1232,6 +1237,19 @@ static bool t_snapshot_queue_order_is_authoritative_and_deterministic() {
         CHECK_EQ(get_str(b, "job_id"), std::string(submitted[i]));
         CHECK_EQ(get_int(a, "submission_seq"), static_cast<int>(i));
         CHECK_EQ(get_int(a, "queue_position"), queue_positions[i]);
+        CHECK(a.find("dispatch_sequence") == a.end());
+    }
+
+    auto dispatched = sim.dispatch(R"({"cmd":"dispatch_batch"})");
+    CHECK_EQ(get_int(dispatched, "count"), 2);
+    auto after = sim.dispatch(R"({"cmd":"snapshot"})");
+    auto& jobs3 = after.at("jobs").get<picojson::array>();
+    for (auto& value : jobs3) {
+        auto& job = value.get<picojson::object>();
+        const std::string id = get_str(job, "job_id");
+        if (id == "SHORT_A") CHECK_EQ(get_int(job, "dispatch_sequence"), 0);
+        if (id == "SHORT_B") CHECK_EQ(get_int(job, "dispatch_sequence"), 1);
+        if (id == "LONG") CHECK(job.find("dispatch_sequence") == job.end());
     }
     return true;
 }

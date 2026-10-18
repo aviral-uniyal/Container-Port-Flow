@@ -36,6 +36,7 @@ class SnapshotStore:
         self.inserted = []
         self.released = []
         self.statuses = []
+        self.dispatch_updates = []
         self.crane_status = {"C1": "AVAILABLE", "C2": "AVAILABLE"}
 
     @contextmanager
@@ -79,6 +80,12 @@ class SnapshotStore:
                                  work_remaining=work_remaining)
         return True
 
+    def update_dispatch_sequence(self, conn, run_id, job_id, dispatch_sequence):
+        assert run_id == 7
+        self.jobs[job_id]["dispatch_sequence"] = dispatch_sequence
+        self.dispatch_updates.append((job_id, dispatch_sequence))
+        return True
+
     def sync_cranes(self, conn, statuses):
         self.statuses.append(statuses)
         self.crane_status.update({entry["crane_id"]: entry["status"] for entry in statuses})
@@ -96,6 +103,8 @@ def store():
         patch("backend.app.router.insert_crane_assignment", side_effect=state.insert),
         patch("backend.app.router.release_crane_assignment", side_effect=state.release),
         patch("backend.app.router.update_job_status", side_effect=state.update_status),
+        patch("backend.app.router.update_job_dispatch_sequence",
+              side_effect=state.update_dispatch_sequence),
         patch("backend.app.router.update_job_work_progress", side_effect=state.update_progress),
         patch("backend.app.router.batch_sync_crane_statuses", side_effect=state.sync_cranes),
     ]
@@ -114,12 +123,14 @@ def request_for_run():
 def test_new_dispatch_and_repeated_snapshot_are_idempotent(store):
     request = request_for_run()
     active = snapshot("ACTIVE", "ASSIGNED", assigned_job="J1")
+    active["jobs"][0]["dispatch_sequence"] = 0
     _persist_snapshot(request, active)
     _persist_snapshot(request, active)
     assert len(store.inserted) == 1
     assert store.active[0]["simulation_job_id"] == 11
     assert store.released == []
     assert store.jobs["J1"]["status"] == "ACTIVE"
+    assert store.dispatch_updates == [("J1", 0)]
 
 
 def test_terminal_previous_run_assignment_is_closed_before_insert(store):
@@ -385,22 +396,23 @@ def reset_client(bridge):
     return TestClient(app, raise_server_exceptions=False)
 
 
-@pytest.mark.parametrize("old_state, crane_status, expected_run_status, expected_ids", [
-    ("ACTIVE", "ASSIGNED", "FAILED", ["C1"]),
-    ("ACTIVE", "FAILED", "FAILED", []),
-    ("COMPLETED", "AVAILABLE", "COMPLETED", []),
+@pytest.mark.parametrize("old_state, crane_status, expected_run_status", [
+    ("ACTIVE", "ASSIGNED", "FAILED"),
+    ("ACTIVE", "FAILED", "FAILED"),
+    ("COMPLETED", "AVAILABLE", "COMPLETED"),
 ])
 def test_reset_reconciles_only_previous_run(old_state, crane_status,
-                                            expected_run_status, expected_ids):
+                                            expected_run_status):
     bridge = ResetBridge(snapshot(old_state, crane_status,
                                   assigned_job="J1" if crane_status == "ASSIGNED" else ""))
     client = reset_client(bridge)
     with patch("backend.app.router.get_connection") as connection, \
-         patch("backend.app.router.get_active_assignments_for_run", return_value=[]) as active, \
+         patch("backend.app.router.get_active_assignments_for_run",
+               return_value=[{"crane_id": "C2"}]) as active, \
          patch("backend.app.router.cancel_unfinished_jobs_for_run") as cancel, \
          patch("backend.app.router.release_active_assignments_for_run") as release, \
-         patch("backend.app.router.make_assigned_cranes_available") as available, \
-         patch("backend.app.router.batch_sync_crane_statuses", side_effect=lambda conn, statuses: len(statuses)), \
+         patch("backend.app.router.batch_sync_crane_statuses",
+               side_effect=lambda conn, statuses: len(statuses)) as sync, \
          patch("backend.app.router.close_simulation_run") as close, \
          patch("backend.app.router.insert_simulation_run", return_value=8):
         conn = connection.return_value.__enter__.return_value
@@ -410,7 +422,10 @@ def test_reset_reconciles_only_previous_run(old_state, crane_status,
         active.assert_called_once_with(conn, 7)
         cancel.assert_called_once_with(conn, 7)
         release.assert_called_once_with(conn, 7, "SIMULATION_RESET")
-        available.assert_called_once_with(conn, expected_ids)
+        sync.assert_called_once_with(conn, [
+            {"crane_id": "C1", "status": "AVAILABLE"},
+            {"crane_id": "C2", "status": "AVAILABLE"},
+        ])
         close.assert_called_once_with(conn, 7, expected_run_status)
         assert client.app.state.current_run_id == 8
 
@@ -441,7 +456,8 @@ def test_cpp_init_failure_after_db_prepare_closes_new_run_and_disables_bridge():
          patch("backend.app.router.get_active_assignments_for_run", return_value=[]), \
          patch("backend.app.router.cancel_unfinished_jobs_for_run"), \
          patch("backend.app.router.release_active_assignments_for_run"), \
-         patch("backend.app.router.make_assigned_cranes_available"), \
+         patch("backend.app.router.batch_sync_crane_statuses",
+               side_effect=lambda conn, statuses: len(statuses)), \
          patch("backend.app.router.close_simulation_run") as close, \
          patch("backend.app.router.insert_simulation_run", return_value=8):
         response = client.post("/simulation/init", json={"berths": 1, "cranes": 1, "trucks": 0})

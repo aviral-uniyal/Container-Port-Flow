@@ -40,6 +40,7 @@ from backend.app.database import (
     release_active_crane_assignments_by_job,
     release_crane_assignment,
     update_crane_status,
+    update_job_dispatch_sequence,
     batch_sync_crane_statuses,
     update_job_status,
     update_job_work_progress,
@@ -82,6 +83,17 @@ def test_ship_migration_preserves_legacy_jobs_and_limits_ship_per_run() -> None:
     assert "ON simulation_jobs (run_id, ship_id)" in migration
     assert "WHERE ship_id IS NOT NULL" in migration
     assert "NOT NULL" not in migration.split("ADD COLUMN ship_id INTEGER", 1)[1].split(";", 1)[0]
+
+
+def test_dispatch_sequence_migration_preserves_pending_legacy_jobs() -> None:
+    migration = (Path(__file__).resolve().parents[2] / "database" / "migrations" /
+                 "004_simulation_job_dispatch_sequence.sql").read_text(encoding="utf-8")
+    assert "ADD COLUMN IF NOT EXISTS dispatch_sequence INTEGER" in migration
+    assert "CHECK (dispatch_sequence >= 0)" in migration
+    assert "ON simulation_jobs (run_id, dispatch_sequence)" in migration
+    assert "WHERE dispatch_sequence IS NOT NULL" in migration
+    assert "CREATE UNIQUE INDEX IF NOT EXISTS" in migration
+    assert "NOT NULL" not in migration.split("ADD COLUMN IF NOT EXISTS dispatch_sequence INTEGER", 1)[1].split(";", 1)[0]
 
 
 def test_startup_inventory_transaction_rolls_back_on_error() -> None:
@@ -539,6 +551,22 @@ class TestSimulationSchemaQueries:
         mock_cur.rowcount = 0
         not_found = update_job_status(mock_conn, run_id=42, job_id="JOB_MISSING", status="COMPLETED")
         assert not_found is False
+
+    def test_update_job_dispatch_sequence_is_immutable(self) -> None:
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_conn.cursor.return_value.__enter__.return_value = mock_cur
+        mock_cur.rowcount = 1
+
+        assert update_job_dispatch_sequence(
+            mock_conn, run_id=42, job_id="JOB_A", dispatch_sequence=0) is True
+        sql, params = mock_cur.execute.call_args.args
+        assert "dispatch_sequence IS NULL OR dispatch_sequence" in sql
+        assert params == {"run_id": 42, "job_id": "JOB_A", "dispatch_sequence": 0}
+
+        with pytest.raises(ValueError, match="non-negative"):
+            update_job_dispatch_sequence(
+                mock_conn, run_id=42, job_id="JOB_A", dispatch_sequence=-1)
 
     def test_update_job_status_completed_sets_work_counters(self) -> None:
         """COMPLETED status → SQL includes work_completed = work_total and work_remaining = 0."""

@@ -1,48 +1,57 @@
-const isQueued = job => job.state === 'PENDING' || job.state === 'INTERRUPTED'
-
 export const executionStatusLabel = state => String(state).replace(/_/g, ' ').toUpperCase()
 
-const queueCompare = (a, b) => {
-  const aPosition = Number.isFinite(a.queue_position) ? a.queue_position : Number.MAX_SAFE_INTEGER
-  const bPosition = Number.isFinite(b.queue_position) ? b.queue_position : Number.MAX_SAFE_INTEGER
-  if (aPosition !== bPosition) return aPosition - bPosition
-  const sequenceDifference = (a.submission_seq ?? Number.MAX_SAFE_INTEGER) -
-    (b.submission_seq ?? Number.MAX_SAFE_INTEGER)
-  if (sequenceDifference !== 0) return sequenceDifference
+export function blockedExecutionFeedback(error) {
+  return error
+    ? {
+        message: `Execution stopped because the backend could not safely continue: ${error}`,
+        severity: 'err',
+      }
+    : {
+        message: 'Execution is blocked by unavailable resources or interrupted work.',
+        severity: 'warn',
+      }
+}
+
+const deterministicCompare = (a, b) => {
+  const aSequence = Number.isFinite(a.submission_seq) ? a.submission_seq : Number.MAX_SAFE_INTEGER
+  const bSequence = Number.isFinite(b.submission_seq) ? b.submission_seq : Number.MAX_SAFE_INTEGER
+  if (aSequence !== bSequence) return aSequence - bSequence
   return String(a.job_id).localeCompare(String(b.job_id))
 }
 
+const queueCompare = (a, b) => {
+  const aPosition = Number.isInteger(a.queue_position) && a.queue_position > 0
+    ? a.queue_position
+    : Number.MAX_SAFE_INTEGER
+  const bPosition = Number.isInteger(b.queue_position) && b.queue_position > 0
+    ? b.queue_position
+    : Number.MAX_SAFE_INTEGER
+  if (aPosition !== bPosition) return aPosition - bPosition
+  return deterministicCompare(a, b)
+}
+
 /**
- * Keep established row positions stable while allowing the authoritative C++
- * queue order to rearrange only jobs that are still queued. Locked rows act as
- * anchors, so ACTIVE -> COMPLETED transitions never make another job jump.
+ * Present dispatched jobs in their immutable C++ first-dispatch order, then
+ * jobs that have not run yet in the live C++ queue order. Lifecycle state is
+ * deliberately excluded, so execution, failure, recovery, and completion do
+ * not move an established row. The result depends only on snapshot metadata,
+ * making browser reloads deterministic without a frontend-only cache.
  */
-export function stabilizeJobOrder(jobs, previousOrder = []) {
-  const byId = new Map(jobs.map(job => [job.job_id, job]))
-  const order = previousOrder.filter(id => byId.has(id))
-  const known = new Set(order)
-  const unseen = jobs
-    .filter(job => !known.has(job.job_id))
-    .sort((a, b) => (a.submission_seq ?? Number.MAX_SAFE_INTEGER) -
-      (b.submission_seq ?? Number.MAX_SAFE_INTEGER) ||
-      String(a.job_id).localeCompare(String(b.job_id)))
-  order.push(...unseen.map(job => job.job_id))
-
-  const queuedSlots = []
-  const queuedJobs = []
-  order.forEach((id, index) => {
-    const job = byId.get(id)
-    if (job && isQueued(job)) {
-      queuedSlots.push(index)
-      queuedJobs.push(job)
+export function stabilizeJobOrder(jobs, _previousOrder = []) {
+  const orderedJobs = [...jobs].sort((a, b) => {
+    const aDispatched = Number.isInteger(a.dispatch_sequence) && a.dispatch_sequence >= 0
+    const bDispatched = Number.isInteger(b.dispatch_sequence) && b.dispatch_sequence >= 0
+    if (aDispatched && bDispatched) {
+      if (a.dispatch_sequence !== b.dispatch_sequence) {
+        return a.dispatch_sequence - b.dispatch_sequence
+      }
+      return deterministicCompare(a, b)
     }
-  })
-  queuedJobs.sort(queueCompare)
-  queuedSlots.forEach((slot, index) => {
-    order[slot] = queuedJobs[index].job_id
+    if (aDispatched !== bDispatched) return aDispatched ? -1 : 1
+    return queueCompare(a, b)
   })
 
-  return { order, jobs: order.map(id => byId.get(id)) }
+  return { order: orderedJobs.map(job => job.job_id), jobs: orderedJobs }
 }
 
 export function dispatchFeedback({ count = 0, dispatchedJobs = [], pendingJobs = 0 }) {

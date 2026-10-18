@@ -1294,6 +1294,59 @@ static bool test_ordered_queue_matches_live_policy() {
     return true;
 }
 
+static bool test_dispatch_sequence_preserves_policy_history() {
+    const DispatchPolicy policies[] = {
+        DispatchPolicy::FCFS,
+        DispatchPolicy::SJF,
+        DispatchPolicy::PRIORITY,
+    };
+
+    for (DispatchPolicy policy : policies) {
+        PortDispatcher pd(1, 1, 1, policy);
+        pd.set_auto_dispatch(false);
+        pd.register_crane("C1");
+        pd.submit_job(make_job("JOB_001", 0, 10, 3, 1, 1, 1));
+        pd.submit_job(make_job("JOB_002", 1, 4, 1, 1, 1, 1));
+
+        const std::string expected_first =
+            policy == DispatchPolicy::FCFS ? "JOB_001" : "JOB_002";
+        const std::string expected_second =
+            expected_first == "JOB_001" ? "JOB_002" : "JOB_001";
+
+        ASSERT_TRUE(pd.job_record("JOB_001").dispatch_seq == -1);
+        ASSERT_TRUE(pd.job_record("JOB_002").dispatch_seq == -1);
+        ASSERT_TRUE(pd.flush_dispatch() == std::vector<std::string>({expected_first}));
+        ASSERT_EQ(pd.job_record(expected_first).dispatch_seq, 0);
+
+        pd.complete_job(expected_first);
+        ASSERT_EQ(pd.job_record(expected_first).dispatch_seq, 0);
+        ASSERT_TRUE(pd.flush_dispatch() == std::vector<std::string>({expected_second}));
+        ASSERT_EQ(pd.job_record(expected_second).dispatch_seq, 1);
+
+        pd.complete_job(expected_second);
+        ASSERT_EQ(pd.job_record(expected_first).dispatch_seq, 0);
+        ASSERT_EQ(pd.job_record(expected_second).dispatch_seq, 1);
+    }
+    return true;
+}
+
+static bool test_concurrent_dispatch_sequence_is_deterministic() {
+    PortDispatcher pd(2, 2, 2, DispatchPolicy::PRIORITY);
+    pd.set_auto_dispatch(false);
+    pd.register_crane("C1");
+    pd.register_crane("C2");
+    pd.submit_job(make_job("LOW", 0, 10, 3, 1, 1, 1));
+    pd.submit_job(make_job("HIGH_FIRST", 1, 10, 1, 1, 1, 1));
+    pd.submit_job(make_job("HIGH_SECOND", 2, 10, 1, 1, 1, 1));
+
+    ASSERT_TRUE(pd.flush_dispatch() ==
+                std::vector<std::string>({"HIGH_FIRST", "HIGH_SECOND"}));
+    ASSERT_EQ(pd.job_record("HIGH_FIRST").dispatch_seq, 0);
+    ASSERT_EQ(pd.job_record("HIGH_SECOND").dispatch_seq, 1);
+    ASSERT_EQ(pd.job_record("LOW").dispatch_seq, -1);
+    return true;
+}
+
 // ─── Test 60: Partial batch dispatch under resource contention ────────────────
 static bool test_batch_resource_contention_partial_dispatch() {
     PortDispatcher pd(2, 2, 2, DispatchPolicy::FCFS);
@@ -1581,6 +1634,46 @@ static bool test_step_skips_undersupplied_active_job() {
     return true;
 }
 
+static bool test_failure_lifecycle_is_policy_independent() {
+    const DispatchPolicy policies[] = {
+        DispatchPolicy::FCFS,
+        DispatchPolicy::SJF,
+        DispatchPolicy::PRIORITY,
+    };
+
+    for (DispatchPolicy policy : policies) {
+        PortDispatcher pd(1, 2, 1, policy);
+        pd.register_crane("C1");
+        pd.register_crane("C2");
+        pd.submit_job(make_job("J1", 0, 3, 1, 1, 2, 1));
+
+        pd.on_crane_failed("C1", 0, 3);
+        ASSERT_EQ(pd.job_record("J1").dispatch_seq, 0);
+        ASSERT_TRUE(pd.job_state("J1") == JobState::ACTIVE);
+        ASSERT_EQ(pd.job_record("J1").active_cranes.size(), static_cast<size_t>(1));
+        ASSERT_TRUE(pd.crane_registry().get_crane("C1").status == CraneStatus::FAILED);
+        ASSERT_TRUE(pd.step().advanced_job_ids.empty());
+
+        pd.on_crane_failed("C2", 0, 3);
+        ASSERT_EQ(pd.job_record("J1").dispatch_seq, 0);
+        ASSERT_TRUE(pd.job_state("J1") == JobState::INTERRUPTED);
+        ASSERT_TRUE(pd.job_record("J1").active_cranes.empty());
+        ASSERT_TRUE(pd.crane_registry().get_crane("C2").status == CraneStatus::FAILED);
+        ASSERT_TRUE(pd.step().advanced_job_ids.empty());
+
+        pd.on_crane_recovered("C1");
+        ASSERT_TRUE(pd.job_state("J1") == JobState::ACTIVE);
+        ASSERT_EQ(pd.job_record("J1").active_cranes.size(), static_cast<size_t>(1));
+        ASSERT_TRUE(pd.step().advanced_job_ids.empty());
+
+        pd.on_crane_recovered("C2");
+        ASSERT_EQ(pd.job_record("J1").dispatch_seq, 0);
+        ASSERT_EQ(pd.job_record("J1").active_cranes.size(), static_cast<size_t>(2));
+        ASSERT_TRUE(pd.step().advanced_job_ids == std::vector<std::string>({"J1"}));
+    }
+    return true;
+}
+
 int main() {
     std::cout << "\n=== Port Dispatcher Integration Test Suite ===\n\n";
 
@@ -1664,6 +1757,8 @@ int main() {
     run_test("Batch — flush dispatch SJF order",                test_batch_flush_dispatch_sjf);
     run_test("Batch — flush dispatch Priority order",           test_batch_flush_dispatch_priority);
     run_test("Queue snapshot — live policy and stable ties",     test_ordered_queue_matches_live_policy);
+    run_test("Dispatch sequence — stable policy history",       test_dispatch_sequence_preserves_policy_history);
+    run_test("Dispatch sequence — deterministic concurrency",   test_concurrent_dispatch_sequence_is_deterministic);
     run_test("Batch — resource contention partial dispatch",    test_batch_resource_contention_partial_dispatch);
     run_test("Batch — interrupted prioritized over pending",     test_batch_interrupted_prioritized_over_pending);
     run_test("Batch — complete does not auto-dispatch pending", test_batch_complete_job_no_pending_autodispatch);
@@ -1678,6 +1773,7 @@ int main() {
     run_test("Step — batch continuation requires authorization", test_step_batch_requires_explicit_continuation);
     run_test("Step — failure/recovery preserves progress",      test_step_failure_recovery_preserves_progress);
     run_test("Step — undersupplied active job does not advance", test_step_skips_undersupplied_active_job);
+    run_test("Failure lifecycle is consistent across policies", test_failure_lifecycle_is_policy_independent);
 
     std::cout << "\n─── Summary ────────────────────────\n";
     std::cout << "  Total:  " << g_total  << "\n";

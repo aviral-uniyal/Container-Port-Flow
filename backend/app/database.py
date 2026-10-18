@@ -588,11 +588,36 @@ def update_job_work_progress(
         return cur.rowcount > 0
 
 
+def update_job_dispatch_sequence(
+    conn,
+    *,
+    run_id: int,
+    job_id: str,
+    dispatch_sequence: int,
+) -> bool:
+    """Persist first-dispatch order without allowing later overwrites."""
+    if dispatch_sequence < 0:
+        raise ValueError("dispatch_sequence must be non-negative")
+    sql = """
+        UPDATE simulation_jobs
+           SET dispatch_sequence = %(dispatch_sequence)s
+         WHERE run_id = %(run_id)s AND job_id = %(job_id)s
+           AND (dispatch_sequence IS NULL OR dispatch_sequence = %(dispatch_sequence)s)
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql, {
+            "run_id": run_id,
+            "job_id": job_id,
+            "dispatch_sequence": dispatch_sequence,
+        })
+        return cur.rowcount > 0
+
+
 def get_jobs_for_run(conn, run_id: int) -> list[dict[str, Any]]:
     """Fetch all simulation jobs belonging to a run."""
     sql = """
         SELECT simulation_job_id, run_id, job_id, port_call_id, status,
-               arrival_time, priority,
+               arrival_time, priority, dispatch_sequence,
                work_total, work_completed, work_remaining,
                requested_berths, requested_cranes, requested_trucks,
                allocated_berths, allocated_cranes, allocated_trucks,
