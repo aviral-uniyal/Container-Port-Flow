@@ -38,6 +38,7 @@ export default function JobsTable({ jobs = [], onComplete, onDispatch, batchMode
             </span>
             <button
               id="btn-dispatch-all"
+              type="button"
               className="btn btn--primary btn--sm"
               onClick={onDispatch}
               disabled={loading.dispatch}

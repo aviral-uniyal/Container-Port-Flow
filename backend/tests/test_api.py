@@ -1109,7 +1109,7 @@ class TestInventoryEndpoint:
                     "updated_at": "2026-10-15T12:00:00+00:00",
                 }
             ],
-            "ships": [{"ship_id": 1, "vessel_name": "Vessel A", "status": "NOT ARRIVED"}],
+            "ships": [{"ship_id": 1, "vessel_name": "Vessel A", "status": "NOT ARRIVED", "is_selectable": True}],
         }
         mock_get_inv.return_value = canned_inventory
 
@@ -1124,6 +1124,7 @@ class TestInventoryEndpoint:
         assert data["berths"][0]["berth_name"] == "B-01"
         assert data["cranes"][0]["crane_id"] == "CR-1"
         assert data["ships"][0]["status"] == "NOT ARRIVED"
+        assert data["ships"][0]["is_selectable"] is True
         mock_get_inv.assert_called_once_with(mock_conn, None)
 
     @patch("backend.app.router.get_resource_inventory")

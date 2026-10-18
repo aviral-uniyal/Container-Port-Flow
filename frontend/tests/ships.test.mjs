@@ -19,10 +19,11 @@ let filterInventoryShips
 let matchingShips
 let selectableShips
 let nextShipIndex
+let submittedShipSelection
 
 before(async () => {
   server = await createServer({ server: { middlewareMode: true }, appType: 'custom' })
-  ;({ default: JobForm, matchingShips, selectableShips, nextShipIndex } =
+  ;({ default: JobForm, matchingShips, selectableShips, nextShipIndex, submittedShipSelection } =
     await server.ssrLoadModule('/src/components/JobForm.jsx'))
   ;({ default: DatabaseInventory, filterInventoryShips } =
     await server.ssrLoadModule('/src/components/DatabaseInventory.jsx'))
@@ -37,6 +38,24 @@ test('ship search is case-insensitive and only offers unused ships', () => {
   assert.deepEqual(selectableShips(ships).map(ship => ship.ship_id), [11])
   assert.equal(nextShipIndex(-1, 3, 'ArrowDown'), 0)
   assert.equal(nextShipIndex(0, 3, 'ArrowUp'), 2)
+})
+
+test('cancelled ships remain unavailable in the current run but can be reused in a new run', () => {
+  const cancelledInCurrentRun = { ship_id: 14, vessel_name: 'Returning Ship', status: 'NOT ARRIVED', is_selectable: false }
+  const newRun = { ...cancelledInCurrentRun, is_selectable: true }
+  assert.deepEqual(selectableShips([cancelledInCurrentRun]), [])
+  assert.deepEqual(matchingShips([cancelledInCurrentRun], 'returning'), [])
+  assert.deepEqual(selectableShips([newRun]).map(ship => ship.ship_id), [14])
+  assert.deepEqual(matchingShips([newRun], 'returning').map(ship => ship.ship_id), [14])
+})
+
+test('successful submission resets selection without reopening the dropdown', async () => {
+  assert.deepEqual(submittedShipSelection(), {
+    ship_id: null, query: '', open: false, activeIndex: -1,
+  })
+  const source = await readFile(new URL('../src/components/JobForm.jsx', import.meta.url), 'utf8')
+  assert.match(source, /if \(submitted\) resetShipAfterSubmit\(\)/)
+  assert.match(source, /function resetShipAfterSubmit\(\)[\s\S]*?shipSearchRef\.current\?\.blur\(\)/)
 })
 
 test('ship selector is required before submission and supports keyboard and clearing', async () => {
@@ -63,6 +82,15 @@ test('unavailable inventory does not imply ships are selectable', () => {
   }))
   assert.match(html, /Ship inventory unavailable: Database unavailable/)
   assert.match(html, /id="btn-submit-job"[^>]*disabled=""/)
+})
+
+test('an ordinary inventory refresh keeps an existing ship list usable', () => {
+  const html = renderToStaticMarkup(React.createElement(JobForm, {
+    onSubmit: () => {}, ships, inventoryLoading: true, inventoryError: null,
+  }))
+  assert.match(html, /id="job-ship-search"/)
+  assert.doesNotMatch(html, /id="job-ship-search"[^>]*disabled=""/)
+  assert.doesNotMatch(html, /Loading ships from PostgreSQL/)
 })
 
 test('submission sends numeric ship_id and preserves existing job fields', async () => {

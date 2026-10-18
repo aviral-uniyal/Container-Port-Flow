@@ -716,10 +716,26 @@ class TestResourceInventoryQueries:
         ]
         query, params = cur.execute.call_args.args
         assert "j.run_id = %(run_id)s" in query
+        assert "(j.simulation_job_id IS NULL) AS is_selectable" in query
         assert "WHEN j.status = 'COMPLETED'" in query
         assert "('PENDING', 'ACTIVE', 'INTERRUPTED')" in query
         assert "ELSE 'NOT ARRIVED'" in query
         assert params == {"run_id": 7}
+
+    def test_cancelled_ship_is_ineligible_until_a_new_run(self) -> None:
+        mock_conn = MagicMock()
+        cur = mock_conn.cursor.return_value.__enter__.return_value
+        cancelled_ship = {"ship_id": 4, "vessel_name": "Returner", "status": "NOT ARRIVED", "is_selectable": False}
+        cur.fetchall.side_effect = [[], [], [], [cancelled_ship]]
+        current = get_resource_inventory(mock_conn, run_id=7)
+        assert current["ships"][0]["is_selectable"] is False
+        assert current["ships"][0]["status"] == "NOT ARRIVED"
+        assert cur.execute.call_args.args[1] == {"run_id": 7}
+
+        cur.fetchall.side_effect = [[], [], [], [{**cancelled_ship, "is_selectable": True}]]
+        later = get_resource_inventory(mock_conn, run_id=8)
+        assert later["ships"][0]["is_selectable"] is True
+        assert cur.execute.call_args.args[1] == {"run_id": 8}
 
     def test_get_resource_inventory_empty(self) -> None:
         """Returns empty lists when database tables are empty."""

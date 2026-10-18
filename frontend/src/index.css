@@ -6,18 +6,18 @@
 /* ── Design Tokens ──────────────────────────── */
 :root {
   /* Palette */
-  --clr-page-bg:     #f5f6f7;
+  --clr-page-bg:     #f8fafc;
   --clr-card-bg:     #ffffff;
   --clr-border:      #dde1e7;
   --clr-border-dark: #bdc3cc;
-  --clr-text-primary:   #1a1d23;
+  --clr-text-primary:   #1e293b;
   --clr-text-secondary: #5a6172;
   --clr-text-muted:     #8a93a4;
 
-  /* Accent — muted green */
-  --clr-accent:       #2e7d52;
-  --clr-accent-hover: #245f3e;
-  --clr-accent-light: #eaf4ef;
+  /* Decorative accent — blue; status colours remain semantic */
+  --clr-accent:       #2563eb;
+  --clr-accent-hover: #1d4ed8;
+  --clr-accent-light: #dbeafe;
 
   /* Status colours */
   --clr-ok:   #2e7d52;

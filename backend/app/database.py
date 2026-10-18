@@ -854,6 +854,7 @@ def get_resource_inventory(conn, run_id: int | None = None) -> dict[str, list[di
     """
     ships_sql = """
         SELECT s.ship_id, s.vessel_name,
+               (j.simulation_job_id IS NULL) AS is_selectable,
                CASE
                    WHEN j.status = 'COMPLETED' THEN 'COMPLETED & LEFT'
                    WHEN j.status IN ('PENDING', 'ACTIVE', 'INTERRUPTED') THEN 'IN OPERATION'

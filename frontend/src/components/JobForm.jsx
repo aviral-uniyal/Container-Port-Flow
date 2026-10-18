@@ -1,7 +1,9 @@
 import { useEffect, useRef, useState } from 'react'
 
 export function selectableShips(ships) {
-  return Array.isArray(ships) ? ships.filter(ship => ship.status === 'NOT ARRIVED') : []
+  return Array.isArray(ships)
+    ? ships.filter(ship => ship.status === 'NOT ARRIVED' && ship.is_selectable !== false)
+    : []
 }
 
 export function matchingShips(ships, query) {
@@ -16,6 +18,10 @@ export function nextShipIndex(current, count, key) {
   if (key === 'ArrowDown') return (current + 1) % count
   if (key === 'ArrowUp') return current <= 0 ? count - 1 : current - 1
   return current
+}
+
+export function submittedShipSelection() {
+  return { ship_id: null, query: '', open: false, activeIndex: -1 }
 }
 
 /**
@@ -45,8 +51,8 @@ export default function JobForm({ onSubmit, disabled, ships, inventoryLoading, i
   const selectedShip = Array.isArray(ships)
     ? ships.find(ship => ship.ship_id === form.ship_id)
     : null
-  const validShip = selectedShip?.status === 'NOT ARRIVED'
-  const shipListAvailable = Array.isArray(ships) && !inventoryLoading && !inventoryError
+  const validShip = selectedShip?.status === 'NOT ARRIVED' && selectedShip?.is_selectable !== false
+  const shipListAvailable = Array.isArray(ships) && !inventoryError
 
   useEffect(() => {
     if (shipOpen && activeShipIndex >= 0) {
@@ -67,6 +73,15 @@ export default function JobForm({ onSubmit, disabled, ships, inventoryLoading, i
     setActiveShipIndex(0)
     setShipOpen(true)
     shipSearchRef.current?.focus()
+  }
+
+  function resetShipAfterSubmit() {
+    const reset = submittedShipSelection()
+    setForm(prev => ({ ...prev, ship_id: reset.ship_id }))
+    setShipQuery(reset.query)
+    setShipOpen(reset.open)
+    setActiveShipIndex(reset.activeIndex)
+    shipSearchRef.current?.blur()
   }
 
   function handleShipKeyDown(e) {
@@ -96,7 +111,7 @@ export default function JobForm({ onSubmit, disabled, ships, inventoryLoading, i
     e.preventDefault()
     if (!validShip || !shipListAvailable || !onSubmit) return
     const submitted = await onSubmit({ ...form })
-    if (submitted) clearShip()
+    if (submitted) resetShipAfterSubmit()
   }
 
   return (
@@ -159,7 +174,7 @@ export default function JobForm({ onSubmit, disabled, ships, inventoryLoading, i
             </div>
             {inventoryError ? (
               <span className="field__hint field__hint--error">Ship inventory unavailable: {inventoryError}</span>
-            ) : inventoryLoading ? (
+            ) : inventoryLoading && !Array.isArray(ships) ? (
               <span className="field__hint">Loading ships from PostgreSQL…</span>
             ) : !Array.isArray(ships) ? (
               <span className="field__hint">Ship inventory is not loaded yet.</span>

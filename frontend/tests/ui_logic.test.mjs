@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict'
+import { readFile } from 'node:fs/promises'
 import { after, before, test } from 'node:test'
 import React from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { createServer } from 'vite'
+import { dispatchBatch } from '../src/api.js'
 
 let server
 let App
@@ -79,6 +81,30 @@ test('Dispatch All feedback distinguishes empty, waiting, and success', () => {
     dispatchFeedback({ count: 2, dispatchedJobs: ['J1', 'J2'], pendingJobs: 0 }).message,
     'Dispatched 2 jobs: J1, J2.',
   )
+})
+
+test('Dispatch All requests dispatch without announcing automatic completion', async () => {
+  const originalFetch = globalThis.fetch
+  let request
+  globalThis.fetch = async (url, options) => {
+    request = { url, options }
+    return { ok: true, json: async () => ({ count: 2, dispatched_jobs: ['J1', 'J2'] }) }
+  }
+  try {
+    const result = await dispatchBatch()
+    assert.equal(result.ok, true)
+    assert.equal(request.url, '/simulation/dispatch')
+    assert.equal(request.options.method, 'POST')
+    assert.match(dispatchFeedback({ count: result.data.count, dispatchedJobs: result.data.dispatched_jobs }).message, /Dispatched 2 jobs/)
+    const source = await readFile(new URL('../src/App.jsx', import.meta.url), 'utf8')
+    const handler = source.split('async function handleDispatch() {')[1].split('async function handleJobSubmit')[0]
+    assert.match(handler, /await refreshSnapshot\(\)/)
+    assert.match(handler, /await refreshExecution\(\)/)
+    assert.match(handler, /await refreshInventory\(\)/)
+    assert.doesNotMatch(handler, /refreshExecution\(\{ announce: true \}\)/)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
 })
 
 test('Step feedback reports progress, completion, batch no-op, and resource blocking', () => {

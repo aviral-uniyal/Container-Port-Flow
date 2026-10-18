@@ -301,7 +301,7 @@ export default function App() {
     const pendingJobs = (snapshotResult.ok ? snapshotResult.data.jobs ?? [] : jobs)
       .filter(job => job.state === 'PENDING').length
     setFeedback(dispatchFeedback({ count, dispatchedJobs, pendingJobs }))
-    await refreshExecution({ announce: true })
+    await refreshExecution()
     await refreshInventory()
   }
 
