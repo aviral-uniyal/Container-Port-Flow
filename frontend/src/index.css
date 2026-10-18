@@ -237,6 +237,102 @@ body {
   box-shadow: 0 0 0 2px rgba(46, 125, 82, 0.12);
 }
 
+.field__hint {
+  color: var(--clr-text-muted);
+  font-size: var(--text-xs);
+}
+
+.field__hint--error { color: var(--clr-badge-failed-t); }
+
+.ship-selector__control { position: relative; }
+.ship-selector__control .field__input { padding-right: 2.25rem; }
+
+.ship-selector__clear {
+  position: absolute;
+  right: var(--space-2);
+  top: 50%;
+  transform: translateY(-50%);
+  border: 0;
+  background: transparent;
+  color: var(--clr-text-secondary);
+  cursor: pointer;
+  font-size: 1.1rem;
+}
+
+.ship-selector__options {
+  position: absolute;
+  z-index: 10;
+  top: calc(100% + 2px);
+  left: 0;
+  right: 0;
+  max-height: 240px;
+  overflow-y: auto;
+  background: var(--clr-card-bg);
+  border: 1px solid var(--clr-border-dark);
+  border-radius: var(--radius);
+  box-shadow: 0 5px 16px rgba(0, 0, 0, 0.12);
+}
+
+.ship-selector__option,
+.ship-selector__empty {
+  padding: var(--space-2) var(--space-3);
+  font-size: var(--text-sm);
+}
+
+.ship-selector__option { cursor: pointer; }
+.ship-selector__option:hover { background: var(--clr-page-bg); }
+.ship-selector__option--active { background: var(--clr-accent-light); }
+.ship-selector__empty { color: var(--clr-text-muted); }
+
+.ships-inventory {
+  border-top: 1px solid var(--clr-border);
+  padding: var(--space-3) var(--space-5);
+}
+
+.ships-inventory__header {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin-bottom: var(--space-2);
+}
+
+.ships-inventory__header h3 {
+  margin: 0 auto 0 0;
+  font-size: var(--text-xs);
+  font-weight: var(--fw-semi);
+  color: var(--clr-text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.ships-inventory__header h3 span { font-weight: var(--fw-normal); }
+.ships-inventory__search-label { font-size: var(--text-xs); color: var(--clr-text-secondary); }
+.ships-inventory__search { max-width: 200px; }
+
+.ships-inventory__list {
+  max-height: 240px;
+  overflow-y: auto;
+  border: 1px solid var(--clr-border);
+  border-radius: var(--radius);
+}
+
+.ships-inventory__row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  font-size: var(--text-sm);
+}
+
+.ships-inventory__row + .ships-inventory__row { border-top: 1px solid var(--clr-border); }
+.ships-inventory__empty { padding: var(--space-2) var(--space-3); color: var(--clr-text-muted); }
+.ship-status { flex-shrink: 0; border-radius: 999px; padding: 2px var(--space-2); font-size: var(--text-xs); }
+.ship-status--waiting { background: var(--clr-badge-pending); color: var(--clr-badge-pending-t); }
+.ship-status--active { background: var(--clr-badge-active); color: var(--clr-badge-active-t); }
+.ship-status--complete { background: var(--clr-badge-completed); color: var(--clr-badge-completed-t); }
+
 /* Remove number-input spinners for cleaner appearance */
 .field__input[type="number"]::-webkit-inner-spin-button,
 .field__input[type="number"]::-webkit-outer-spin-button {

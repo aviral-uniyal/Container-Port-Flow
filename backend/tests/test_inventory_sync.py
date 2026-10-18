@@ -346,9 +346,11 @@ def test_dispatch_routes_reconcile_the_resulting_snapshot(command, path):
     app.state.db_pool = SimpleNamespace(is_open=True)
     app.state.current_run_id = 7
     app.state.execution = SimulationExecution(app.state.bridge)
-    body = {"job_id": "J1", "arrival_time": 0, "work_total": 2,
+    body = {"ship_id": 1, "job_id": "J1", "arrival_time": 0, "work_total": 2,
             "priority": 0, "berths": 1, "cranes": 1, "trucks": 0}
     with patch("backend.app.router.get_connection"), \
+         patch("backend.app.router.ship_exists", return_value=True), \
+         patch("backend.app.router.ship_has_job_in_run", return_value=False), \
          patch("backend.app.router.insert_simulation_job"), \
          patch("backend.app.router.update_job_status"), \
          patch("backend.app.router._persist_snapshot") as persist:

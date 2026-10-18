@@ -7,6 +7,7 @@ No live PostgreSQL server is required.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -71,6 +72,16 @@ def test_startup_inventory_is_idempotent_and_preserves_history() -> None:
                if "UPDATE crane_assignments" in sql)
     assert all("crane_id = ANY(%(crane_ids)s)" in sql for sql in statements
                if "UPDATE cranes" in sql)
+
+
+def test_ship_migration_preserves_legacy_jobs_and_limits_ship_per_run() -> None:
+    migration = (Path(__file__).resolve().parents[2] / "database" / "migrations" /
+                 "003_simulation_job_ship.sql").read_text(encoding="utf-8")
+    assert "ADD COLUMN ship_id INTEGER" in migration
+    assert "REFERENCES ships (ship_id) ON DELETE RESTRICT" in migration
+    assert "ON simulation_jobs (run_id, ship_id)" in migration
+    assert "WHERE ship_id IS NOT NULL" in migration
+    assert "NOT NULL" not in migration.split("ADD COLUMN ship_id INTEGER", 1)[1].split(";", 1)[0]
 
 
 def test_startup_inventory_transaction_rolls_back_on_error() -> None:
@@ -498,6 +509,7 @@ class TestSimulationSchemaQueries:
             mock_conn,
             run_id=42,
             job_id="JOB_A",
+            ship_id=9,
             arrival_time=0,
             priority=1,
             work_total=10,
@@ -510,6 +522,8 @@ class TestSimulationSchemaQueries:
         assert "INSERT INTO simulation_jobs" in sql
         assert params["run_id"] == 42
         assert params["job_id"] == "JOB_A"
+        assert params["ship_id"] == 9
+        assert "ship_id" in sql
         assert params["work_total"] == 10
 
     def test_update_job_status_rowcount(self) -> None:
@@ -688,20 +702,40 @@ class TestSimulationSchemaQueries:
 
 
 class TestResourceInventoryQueries:
+    def test_ship_status_query_is_scoped_to_current_run(self) -> None:
+        mock_conn = MagicMock()
+        cur = mock_conn.cursor.return_value.__enter__.return_value
+        cur.fetchall.side_effect = [[], [], [], [
+            {"ship_id": 1, "vessel_name": "A", "status": "NOT ARRIVED"},
+            {"ship_id": 2, "vessel_name": "B", "status": "IN OPERATION"},
+            {"ship_id": 3, "vessel_name": "C", "status": "COMPLETED & LEFT"},
+        ]]
+        inv = get_resource_inventory(mock_conn, run_id=7)
+        assert [s["status"] for s in inv["ships"]] == [
+            "NOT ARRIVED", "IN OPERATION", "COMPLETED & LEFT",
+        ]
+        query, params = cur.execute.call_args.args
+        assert "j.run_id = %(run_id)s" in query
+        assert "WHEN j.status = 'COMPLETED'" in query
+        assert "('PENDING', 'ACTIVE', 'INTERRUPTED')" in query
+        assert "ELSE 'NOT ARRIVED'" in query
+        assert params == {"run_id": 7}
+
     def test_get_resource_inventory_empty(self) -> None:
         """Returns empty lists when database tables are empty."""
         mock_conn = MagicMock()
         mock_cur = MagicMock()
         mock_conn.cursor.return_value.__enter__.return_value = mock_cur
-        mock_cur.fetchall.side_effect = [[], [], []]
+        mock_cur.fetchall.side_effect = [[], [], [], []]
 
         inv = get_resource_inventory(mock_conn)
         assert inv == {
             "terminals": [],
             "berths": [],
             "cranes": [],
+            "ships": [],
         }
-        assert mock_cur.execute.call_count == 3
+        assert mock_cur.execute.call_count == 4
 
     def test_get_resource_inventory_populated(self) -> None:
         """Returns terminals, berths, and cranes with ISO formatted updated_at."""
@@ -722,7 +756,8 @@ class TestResourceInventoryQueries:
             {"crane_id": "C1", "terminal_id": 1, "status": "AVAILABLE", "updated_at": ts},
             {"crane_id": "C2", "terminal_id": 1, "status": "ASSIGNED", "updated_at": None},
         ]
-        mock_cur.fetchall.side_effect = [terminals, berths, cranes]
+        ships = [{"ship_id": 1, "vessel_name": "Vessel A", "status": "NOT ARRIVED"}]
+        mock_cur.fetchall.side_effect = [terminals, berths, cranes, ships]
 
         inv = get_resource_inventory(mock_conn)
         assert len(inv["terminals"]) == 1
@@ -738,15 +773,19 @@ class TestResourceInventoryQueries:
         assert inv["cranes"][0]["updated_at"] == ts.isoformat()
         assert inv["cranes"][1]["crane_id"] == "C2"
         assert inv["cranes"][1]["updated_at"] is None
+        assert inv["ships"] == ships
 
         # Verify SQL queries targeted the expected tables
         executed_sqls = [call[0][0] for call in mock_cur.execute.call_args_list]
         assert any("FROM terminals" in sql for sql in executed_sqls)
         assert any("FROM berths" in sql for sql in executed_sqls)
         assert any("FROM cranes" in sql for sql in executed_sqls)
-        crane_query = mock_cur.execute.call_args_list[-1]
+        crane_query = mock_cur.execute.call_args_list[-2]
         assert "WHERE crane_id = ANY(%(crane_ids)s)" in crane_query.args[0]
         assert crane_query.args[1] == {"crane_ids": list(ACTIVE_CRANE_IDS)}
+        ship_query = mock_cur.execute.call_args_list[-1]
+        assert "j.run_id = %(run_id)s" in ship_query.args[0]
+        assert ship_query.args[1] == {"run_id": None}
 
     def test_get_resource_inventory_db_error(self) -> None:
         """Database errors during execution are propagated."""

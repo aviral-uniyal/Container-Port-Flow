@@ -1,8 +1,15 @@
+import { useState } from 'react'
+
+export function filterInventoryShips(ships, query) {
+  const needle = query.trim().toLocaleLowerCase()
+  return ships.filter(ship => ship.vessel_name.toLocaleLowerCase().includes(needle))
+}
+
 /**
  * DatabaseInventory — displays physical infrastructure records from PostgreSQL.
  *
  * Props:
- *   inventory — { terminals, berths, cranes } from GET /inventory, or null.
+ *   inventory — { terminals, berths, cranes, ships } from GET /inventory, or null.
  *   loading   — boolean, true while the request is in-flight.
  *   error     — string | null, populated when the fetch failed.
  *
@@ -10,6 +17,7 @@
  * the volatile C++ simulation runtime snapshot shown in ResourceSummary.
  */
 export default function DatabaseInventory({ inventory, loading, error }) {
+  const [shipSearch, setShipSearch] = useState('')
   const STATUS_BADGE = {
     AVAILABLE: 'badge badge--available',
     ASSIGNED:  'badge badge--assigned',
@@ -68,7 +76,8 @@ export default function DatabaseInventory({ inventory, loading, error }) {
     )
   }
 
-  const { terminals = [], berths = [], cranes = [] } = inventory
+  const { terminals = [], berths = [], cranes = [], ships = [] } = inventory
+  const filteredShips = filterInventoryShips(ships, shipSearch)
 
   /* Build a lookup: terminal_id → terminal_name */
   const terminalName = Object.fromEntries(
@@ -89,6 +98,7 @@ export default function DatabaseInventory({ inventory, loading, error }) {
           <span>{terminals.length} terminal{terminals.length !== 1 ? 's' : ''}</span>
           <span>{berths.length} berth{berths.length !== 1 ? 's' : ''}</span>
           <span>{cranes.length} crane{cranes.length !== 1 ? 's' : ''}</span>
+          <span>{ships.length} ship{ships.length !== 1 ? 's' : ''}</span>
         </div>
       </div>
 
@@ -200,6 +210,30 @@ export default function DatabaseInventory({ inventory, loading, error }) {
           </div>
         </div>
       )}
+
+      <div className="ships-inventory" aria-labelledby="db-ships-title">
+        <div className="ships-inventory__header">
+          <h3 id="db-ships-title">Ships <span>({ships.length} total)</span></h3>
+          <label className="ships-inventory__search-label" htmlFor="db-ships-search">Search ships</label>
+          <input id="db-ships-search" type="search" className="field__input ships-inventory__search"
+            value={shipSearch} onChange={e => setShipSearch(e.target.value)}
+            placeholder="Search by ship name" />
+        </div>
+        <div className="ships-inventory__list" role="region" aria-label="Ships from PostgreSQL" tabIndex={0}>
+          {filteredShips.length === 0 ? (
+            <p className="ships-inventory__empty">
+              {ships.length === 0 ? 'No ship records found in PostgreSQL.' : 'No ships match your search.'}
+            </p>
+          ) : filteredShips.map(ship => (
+            <div className="ships-inventory__row" key={ship.ship_id}>
+              <span>{ship.vessel_name}</span>
+              <span className={`ship-status ship-status--${ship.status === 'IN OPERATION' ? 'active' : ship.status === 'COMPLETED & LEFT' ? 'complete' : 'waiting'}`}>
+                {ship.status}
+              </span>
+            </div>
+          ))}
+        </div>
+      </div>
     </section>
   )
 }

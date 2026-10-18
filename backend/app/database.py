@@ -448,6 +448,22 @@ def cancel_unfinished_jobs_for_run(conn, run_id: int) -> int:
 # ── 3. Simulation Jobs ────────────────────────────────────────────────────────
 
 
+def ship_exists(conn, ship_id: int) -> bool:
+    """Check the vessel registry before touching the C++ dispatcher."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT 1 FROM ships WHERE ship_id = %(ship_id)s", {"ship_id": ship_id})
+        return cur.fetchone() is not None
+
+
+def ship_has_job_in_run(conn, *, run_id: int, ship_id: int) -> bool:
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT 1 FROM simulation_jobs
+             WHERE run_id = %(run_id)s AND ship_id = %(ship_id)s
+        """, {"run_id": run_id, "ship_id": ship_id})
+        return cur.fetchone() is not None
+
+
 def insert_simulation_job(
     conn,
     *,
@@ -460,6 +476,7 @@ def insert_simulation_job(
     requested_cranes: int = 1,
     requested_trucks: int = 0,
     port_call_id: int | None = None,
+    ship_id: int | None = None,
 ) -> int:
     """Insert a simulation job and return its ``simulation_job_id``.
 
@@ -467,10 +484,10 @@ def insert_simulation_job(
     """
     sql = """
         INSERT INTO simulation_jobs
-               (run_id, job_id, port_call_id, arrival_time, priority,
+               (run_id, job_id, port_call_id, ship_id, arrival_time, priority,
                 work_total, work_remaining,
                 requested_berths, requested_cranes, requested_trucks)
-        VALUES (%(run_id)s, %(job_id)s, %(port_call_id)s, %(arrival_time)s, %(priority)s,
+        VALUES (%(run_id)s, %(job_id)s, %(port_call_id)s, %(ship_id)s, %(arrival_time)s, %(priority)s,
                 %(work_total)s, %(work_total)s,
                 %(requested_berths)s, %(requested_cranes)s, %(requested_trucks)s)
         RETURNING simulation_job_id
@@ -480,6 +497,7 @@ def insert_simulation_job(
             "run_id": run_id,
             "job_id": job_id,
             "port_call_id": port_call_id,
+            "ship_id": ship_id,
             "arrival_time": arrival_time,
             "priority": priority,
             "work_total": work_total,
@@ -803,18 +821,19 @@ def get_disruption_events_for_run(conn, run_id: int) -> list[dict[str, Any]]:
 # ── 6. Resource Inventory ──────────────────────────────────────────────────────
 
 
-def get_resource_inventory(conn) -> dict[str, list[dict[str, Any]]]:
+def get_resource_inventory(conn, run_id: int | None = None) -> dict[str, list[dict[str, Any]]]:
     """Return a snapshot of physical infrastructure from PostgreSQL.
 
-    Queries three tables in a single connection:
+    Queries inventory and current-run ship status in a single connection:
       - terminals  : all terminal records
       - berths     : all berth records (ordered by terminal then berth)
       - cranes     : the twelve active demo cranes only
+      - ships      : registry names and status derived from this run's jobs
 
     ``updated_at`` on cranes is serialised to an ISO-8601 string so the
     result is directly JSON-serialisable.
 
-    Returns a dict with keys ``"terminals"``, ``"berths"``, and ``"cranes"``,
+    Returns a dict with keys ``"terminals"``, ``"berths"``, ``"cranes"``, and ``"ships"``,
     each containing a list of row dicts.
     """
     terminals_sql = """
@@ -833,10 +852,23 @@ def get_resource_inventory(conn) -> dict[str, list[dict[str, Any]]]:
          WHERE crane_id = ANY(%(crane_ids)s)
          ORDER BY length(crane_id), crane_id
     """
+    ships_sql = """
+        SELECT s.ship_id, s.vessel_name,
+               CASE
+                   WHEN j.status = 'COMPLETED' THEN 'COMPLETED & LEFT'
+                   WHEN j.status IN ('PENDING', 'ACTIVE', 'INTERRUPTED') THEN 'IN OPERATION'
+                   ELSE 'NOT ARRIVED'
+               END AS status
+          FROM ships s
+          LEFT JOIN simulation_jobs j
+            ON j.ship_id = s.ship_id AND j.run_id = %(run_id)s
+         ORDER BY s.vessel_name, s.ship_id
+    """
     result: dict[str, list[dict[str, Any]]] = {
         "terminals": [],
         "berths": [],
         "cranes": [],
+        "ships": [],
     }
 
     with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
@@ -848,6 +880,9 @@ def get_resource_inventory(conn) -> dict[str, list[dict[str, Any]]]:
 
         cur.execute(cranes_sql, {"crane_ids": list(ACTIVE_CRANE_IDS)})
         rows = cur.fetchall()
+
+        cur.execute(ships_sql, {"run_id": run_id})
+        result["ships"] = [dict(row) for row in cur.fetchall()]
 
     # Convert datetime objects to ISO strings so FastAPI can serialise them.
     crane_list = []

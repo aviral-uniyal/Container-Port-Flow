@@ -52,6 +52,7 @@ class CraneRegisterRequest(BaseModel):
 
 class JobSubmitRequest(BaseModel):
     """POST /simulation/jobs – submit a vessel job."""
+    ship_id: int = Field(..., ge=1, description="Selected PostgreSQL ship ID")
     job_id: str = Field(
         ..., min_length=1, description="Unique job identifier"
     )

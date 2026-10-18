@@ -351,6 +351,7 @@ class TestJobSubmission:
     """Job submission success and validation failures."""
 
     _VALID_JOB = {
+        "ship_id": 1,
         "job_id": "J1",
         "arrival_time": 0,
         "work_total": 10,
@@ -365,14 +366,21 @@ class TestJobSubmission:
             response={"ok": True, "job_id": "J1", "state": "PENDING"}
         )
         client = _client(fake)
-        resp = client.post("/simulation/jobs", json=self._VALID_JOB)
+        app.state.current_run_id = 42
+        with patch("backend.app.router.ship_exists", return_value=True), \
+             patch("backend.app.router.ship_has_job_in_run", return_value=False), \
+             patch("backend.app.router._persist_snapshot"), \
+             patch.object(fake, "send", wraps=fake.send) as send:
+            resp = client.post("/simulation/jobs", json=self._VALID_JOB)
         assert resp.status_code == 200
         assert resp.json()["job_id"] == "J1"
         # Verify all fields forwarded
-        assert fake.last_command["cmd"] == "submit_job"
+        submitted = send.call_args_list[0].args[0]
+        assert submitted["cmd"] == "submit_job"
         for key in ("job_id", "arrival_time", "work_total", "priority",
                      "berths", "cranes", "trucks"):
-            assert fake.last_command[key] == self._VALID_JOB[key]
+            assert submitted[key] == self._VALID_JOB[key]
+        assert "ship_id" not in submitted
 
     def test_submit_job_missing_field_422(self):
         client = _client()
@@ -728,16 +736,13 @@ class TestJobSubmissionPersistence:
 
     @pytest.fixture(autouse=True)
     def isolate_snapshot_reconciliation(self, request):
-        if request.node.name in (
-            "test_job_submission_no_db_pool_reports_reconciliation",
-            "test_job_submission_db_pool_closed_reports_reconciliation",
-        ):
-            yield
-            return
-        with patch("backend.app.router._sync_crane_statuses"):
+        with patch("backend.app.router.ship_exists", return_value=True), \
+             patch("backend.app.router.ship_has_job_in_run", return_value=False), \
+             patch("backend.app.router._persist_snapshot"):
             yield
 
     _VALID_JOB = {
+        "ship_id": 1,
         "job_id": "J1",
         "arrival_time": 0,
         "work_total": 10,
@@ -773,6 +778,7 @@ class TestJobSubmissionPersistence:
         call_kwargs = mock_insert.call_args[1]
         assert call_kwargs["run_id"] == 42
         assert call_kwargs["job_id"] == "J1"
+        assert call_kwargs["ship_id"] == 1
         assert call_kwargs["arrival_time"] == 0
         assert call_kwargs["priority"] == 1
         assert call_kwargs["work_total"] == 10
@@ -782,10 +788,10 @@ class TestJobSubmissionPersistence:
 
     @patch("backend.app.router.insert_simulation_job")
     @patch("backend.app.router.get_connection")
-    def test_job_submission_db_failure_still_returns_200(
+    def test_job_submission_db_failure_rejected_before_cpp(
         self, mock_get_conn: MagicMock, mock_insert: MagicMock
     ):
-        """If the DB write raises, C++ success still returns 200."""
+        """If the DB insert raises, C++ is never changed."""
         mock_conn = MagicMock()
         mock_get_conn.return_value.__enter__ = MagicMock(return_value=mock_conn)
         mock_get_conn.return_value.__exit__ = MagicMock(return_value=False)
@@ -798,12 +804,11 @@ class TestJobSubmissionPersistence:
 
         resp = client.post("/simulation/jobs", json=self._VALID_JOB)
 
-        assert resp.status_code == 200
-        assert resp.json()["ok"] is True
-        assert resp.json()["job_id"] == "J1"
+        assert resp.status_code == 503
+        assert fake.last_command is None
 
-    def test_job_submission_no_run_id_still_returns_200(self):
-        """No current_run_id → skip persistence, return 200."""
+    def test_job_submission_no_run_id_is_rejected(self):
+        """A new ship job requires a current persisted run."""
         fake = FakeBridge(response={"ok": True, "job_id": "J1", "state": "PENDING"})
         pool = FakeDBPool(is_open=True, healthy=True)
         client = _client(fake, pool)
@@ -811,8 +816,8 @@ class TestJobSubmissionPersistence:
 
         resp = client.post("/simulation/jobs", json=self._VALID_JOB)
 
-        assert resp.status_code == 200
-        assert resp.json()["ok"] is True
+        assert resp.status_code == 409
+        assert fake.last_command is None
 
     def test_job_submission_no_db_pool_reports_reconciliation(self):
         """An active persisted run cannot silently skip snapshot persistence."""
@@ -825,7 +830,7 @@ class TestJobSubmissionPersistence:
         resp = client.post("/simulation/jobs", json=self._VALID_JOB)
 
         assert resp.status_code == 503
-        assert "reconciliation" in resp.json()["detail"]
+        assert fake.last_command is None
 
     def test_job_submission_db_pool_closed_reports_reconciliation(self):
         """A closed pool cannot silently skip snapshot persistence."""
@@ -837,13 +842,13 @@ class TestJobSubmissionPersistence:
         resp = client.post("/simulation/jobs", json=self._VALID_JOB)
 
         assert resp.status_code == 503
-        assert "reconciliation" in resp.json()["detail"]
+        assert fake.last_command is None
 
     @patch("backend.app.router.insert_simulation_job")
     def test_job_submission_cpp_failure_does_not_persist(
         self, mock_insert: MagicMock
     ):
-        """Failed C++ submission → insert_simulation_job never called."""
+        """Failed C++ submission rolls back the provisional database insert."""
         fake = FakeBridge(response={"ok": False, "error": "duplicate job"})
         pool = FakeDBPool(is_open=True, healthy=True)
         client = _client(fake, pool)
@@ -852,7 +857,51 @@ class TestJobSubmissionPersistence:
         resp = client.post("/simulation/jobs", json=self._VALID_JOB)
 
         assert resp.status_code == 400
-        mock_insert.assert_not_called()
+        mock_insert.assert_called_once()
+        assert pool.last_conn.rollbacks == 1
+
+    @pytest.mark.parametrize("exists,used,expected", [
+        (False, False, 404), (True, True, 409),
+    ])
+    def test_invalid_or_used_ship_never_reaches_cpp(self, exists, used, expected):
+        fake = FakeBridge()
+        client = _client(fake)
+        app.state.current_run_id = 42
+        with patch("backend.app.router.ship_exists", return_value=exists), \
+             patch("backend.app.router.ship_has_job_in_run", return_value=used):
+            resp = client.post("/simulation/jobs", json=self._VALID_JOB)
+        assert resp.status_code == expected
+        assert fake.last_command is None
+
+    def test_same_ship_can_be_submitted_in_later_run(self):
+        fake = FakeBridge(response={"ok": True, "job_id": "J1", "state": "PENDING"})
+        client = _client(fake)
+        checked_runs = []
+
+        def unused(conn, *, run_id, ship_id):
+            checked_runs.append((run_id, ship_id))
+            return False
+
+        with patch("backend.app.router.ship_exists", return_value=True), \
+             patch("backend.app.router.ship_has_job_in_run", side_effect=unused), \
+             patch("backend.app.router._persist_snapshot"):
+            app.state.current_run_id = 42
+            assert client.post("/simulation/jobs", json=self._VALID_JOB).status_code == 200
+            app.state.current_run_id = 43
+            assert client.post("/simulation/jobs", json=self._VALID_JOB).status_code == 200
+        assert checked_runs == [(42, 1), (43, 1)]
+
+    def test_snapshot_failure_retains_accepted_job_for_reconciliation(self):
+        fake = FakeBridge(response={"ok": True, "job_id": "J1", "state": "PENDING"})
+        pool = FakeDBPool()
+        client = _client(fake, pool)
+        app.state.current_run_id = 42
+        with patch("backend.app.router._sync_crane_statuses",
+                   side_effect=HTTPException(status_code=503, detail="sync failed")):
+            resp = client.post("/simulation/jobs", json=self._VALID_JOB)
+        assert resp.status_code == 503
+        assert pool.last_conn.commits == 1
+        assert fake.last_command["cmd"] == "submit_job"
 
 
 # ─── Persistence: POST /simulation/jobs/{job_id}/complete ─────────────────────
@@ -1060,6 +1109,7 @@ class TestInventoryEndpoint:
                     "updated_at": "2026-10-15T12:00:00+00:00",
                 }
             ],
+            "ships": [{"ship_id": 1, "vessel_name": "Vessel A", "status": "NOT ARRIVED"}],
         }
         mock_get_inv.return_value = canned_inventory
 
@@ -1073,7 +1123,8 @@ class TestInventoryEndpoint:
         assert data["terminals"][0]["terminal_name"] == "Terminal Alpha"
         assert data["berths"][0]["berth_name"] == "B-01"
         assert data["cranes"][0]["crane_id"] == "CR-1"
-        mock_get_inv.assert_called_once_with(mock_conn)
+        assert data["ships"][0]["status"] == "NOT ARRIVED"
+        mock_get_inv.assert_called_once_with(mock_conn, None)
 
     @patch("backend.app.router.get_resource_inventory")
     @patch("backend.app.router.get_connection")
@@ -1084,7 +1135,7 @@ class TestInventoryEndpoint:
         mock_conn = MagicMock()
         mock_get_conn.return_value.__enter__ = MagicMock(return_value=mock_conn)
         mock_get_conn.return_value.__exit__ = MagicMock(return_value=False)
-        mock_get_inv.return_value = {"terminals": [], "berths": [], "cranes": []}
+        mock_get_inv.return_value = {"terminals": [], "berths": [], "cranes": [], "ships": []}
 
         fake = FakeBridge(alive=False)
         pool = FakeDBPool(is_open=True, healthy=True)
@@ -1092,7 +1143,7 @@ class TestInventoryEndpoint:
 
         resp = client.get("/inventory")
         assert resp.status_code == 200
-        assert resp.json() == {"terminals": [], "berths": [], "cranes": []}
+        assert resp.json() == {"terminals": [], "berths": [], "cranes": [], "ships": []}
 
 
 # ─── Crane Failure & Recovery ─────────────────────────────────────────────────

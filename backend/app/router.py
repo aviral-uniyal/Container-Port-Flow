@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
+import psycopg2
 
 from .cpp_bridge import CppBridgeError
 from .database import (
@@ -40,6 +41,8 @@ from .database import (
     release_active_assignments_for_run,
     release_active_crane_assignments_by_job,
     release_crane_assignment,
+    ship_exists,
+    ship_has_job_in_run,
     update_crane_status,
     update_job_status,
     update_job_work_progress,
@@ -401,9 +404,21 @@ def simulation_register_crane(body: CraneRegisterRequest, request: Request):
     return resp
 
 @router.post("/simulation/jobs")
-def simulation_submit_job(body: JobSubmitRequest, request: Request):
+async def simulation_submit_job(body: JobSubmitRequest, request: Request):
     """Submit a vessel job to the C++ dispatcher."""
+    execution = _get_execution(request)
+    async with execution.lock:
+        return await asyncio.to_thread(_simulation_submit_job_sync, body, request)
+
+
+def _simulation_submit_job_sync(body: JobSubmitRequest, request: Request):
     bridge = _get_bridge(request)
+    run_id = getattr(request.app.state, "current_run_id", None)
+    pool = _get_db_pool(request)
+    if run_id is None:
+        raise HTTPException(status_code=409, detail="Initialize a simulation before submitting a ship job")
+    if pool is None:
+        raise HTTPException(status_code=503, detail="Database unavailable; ship job was not submitted")
     cmd: dict[str, Any] = {
         "cmd": "submit_job",
         "job_id": body.job_id,
@@ -414,49 +429,44 @@ def simulation_submit_job(body: JobSubmitRequest, request: Request):
         "cranes": body.cranes,
         "trucks": body.trucks,
     }
-    resp = _send(bridge, cmd)
-
-    # ── Persist submitted job ─────────────────────────────────────────────
-    run_id = getattr(request.app.state, "current_run_id", None)
-    if run_id is None:
-        logger.warning(
-            "No current_run_id; skipping job submission persistence for %s",
-            body.job_id,
-        )
-    else:
-        pool = _get_db_pool(request)
-        if pool is not None:
-            try:
-                with get_connection(pool) as conn:
-                    insert_simulation_job(
-                        conn,
-                        run_id=run_id,
-                        job_id=body.job_id,
-                        arrival_time=body.arrival_time,
-                        priority=body.priority,
-                        work_total=body.work_total,
-                        requested_berths=body.berths,
-                        requested_cranes=body.cranes,
-                        requested_trucks=body.trucks,
-                    )
-                logger.info("Persisted job %s for run %d", body.job_id, run_id)
-            except Exception as exc:
-                logger.warning(
-                    "DB write failed for job %s: %s", body.job_id, exc
-                )
-        else:
-            logger.warning(
-                "No database pool available; skipping job submission persistence"
+    cpp_submitted = False
+    try:
+        with get_connection(pool) as conn:
+            if not ship_exists(conn, body.ship_id):
+                raise HTTPException(status_code=404, detail="Selected ship was not found")
+            if ship_has_job_in_run(conn, run_id=run_id, ship_id=body.ship_id):
+                raise HTTPException(status_code=409, detail="Ship already has a job in this run")
+            insert_simulation_job(
+                conn, run_id=run_id, job_id=body.job_id, ship_id=body.ship_id,
+                arrival_time=body.arrival_time, priority=body.priority,
+                work_total=body.work_total, requested_berths=body.berths,
+                requested_cranes=body.cranes, requested_trucks=body.trucks,
             )
-
-    # ── Bug 2 fix: sync crane statuses ───────────────────────────────────
-    # A job submission may immediately dispatch the job (PENDING → ACTIVE),
-    # causing cranes to transition AVAILABLE → ASSIGNED in the C++ runtime.
-    # We take a snapshot right after and persist the current crane statuses
-    # to PostgreSQL so Database Inventory reflects the real assignment state.
-    _sync_crane_statuses(bridge, request)
-
-    return resp
+            resp = _send(bridge, cmd)
+            cpp_submitted = True
+        # Keep the accepted job row even if later snapshot reconciliation fails.
+        # The existing /simulation/reconcile route can then retry from C++.
+        _sync_crane_statuses(bridge, request)
+        return resp
+    except HTTPException as exc:
+        if cpp_submitted:
+            raise HTTPException(status_code=503, detail=(
+                "Job submitted in C++; database synchronization failed; reconciliation required"
+            )) from exc
+        raise
+    except psycopg2.IntegrityError as exc:
+        constraint = getattr(getattr(exc, "diag", None), "constraint_name", None)
+        if not cpp_submitted and constraint == "uq_simulation_jobs_run_ship":
+            raise HTTPException(status_code=409, detail="Ship already has a job in this run") from exc
+        if not cpp_submitted and constraint == "uq_simulation_jobs_run_job":
+            raise HTTPException(status_code=409, detail="Job ID already exists in this run") from exc
+        if not cpp_submitted and constraint == "simulation_jobs_ship_id_fkey":
+            raise HTTPException(status_code=404, detail="Selected ship was not found") from exc
+        logger.exception("Ship job persistence failed")
+        raise HTTPException(status_code=503, detail="Database synchronization failed; reconciliation required" if cpp_submitted else "Database unavailable; ship job was not submitted") from exc
+    except Exception as exc:
+        logger.exception("Ship job submission failed")
+        raise HTTPException(status_code=503, detail="Database synchronization failed; reconciliation required" if cpp_submitted else "Database unavailable; ship job was not submitted") from exc
 
 
 @router.post("/simulation/jobs/{job_id}/complete")
@@ -862,7 +872,7 @@ def get_inventory(request: Request):
         )
     try:
         with get_connection(pool) as conn:
-            data = get_resource_inventory(conn)
+            data = get_resource_inventory(conn, getattr(request.app.state, "current_run_id", None))
     except Exception as exc:
         logger.warning("GET /inventory DB error: %s", exc)
         raise HTTPException(

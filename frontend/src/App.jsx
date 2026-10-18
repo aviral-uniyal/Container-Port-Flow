@@ -141,10 +141,11 @@ export default function App() {
     setInventoryError(null)
     const result = await fetchInventory()
     setInventoryLoading(false)
-    if (result.ok) {
+    if (result.ok && Array.isArray(result.data?.ships)) {
       setInventory(result.data)
     } else {
-      setInventoryError(result.error)
+      setInventory(null)
+      setInventoryError(result.error || 'The backend did not return ship records. Check the Stage 1 database migration.')
     }
   }, [])
 
@@ -279,6 +280,7 @@ export default function App() {
       return
     }
     const [snapshotResult] = await Promise.all([refreshSnapshot(), refreshExecution()])
+    await refreshInventory()
     const snapshotJobs = snapshotResult.ok ? (snapshotResult.data.jobs ?? []) : jobs
     setFeedback(stepFeedback(result.data, snapshotJobs, batchMode))
   }
@@ -311,7 +313,7 @@ export default function App() {
     if (!result.ok) {
       setFeedback({ message: `Job submit failed: ${result.error}`, severity: 'err' })
       await Promise.all([refreshSnapshot(), refreshExecution(), refreshInventory()])
-      return
+      return false
     }
     setFeedback({
       message: `Job "${formData.job_id}" submitted successfully.`,
@@ -320,6 +322,7 @@ export default function App() {
     await refreshSnapshot()
     await refreshExecution({ announce: true })
     await refreshInventory()
+    return true
   }
 
   /* ── Complete job ── */
@@ -472,7 +475,13 @@ export default function App() {
 
         <div className="app-main__two-col">
           <SimulationSetup onSubmit={handleInit} disabled={loading.init} />
-          <JobForm onSubmit={handleJobSubmit} disabled={loading.job} />
+          <JobForm
+            onSubmit={handleJobSubmit}
+            disabled={loading.job}
+            ships={inventory?.ships}
+            inventoryLoading={inventoryLoading}
+            inventoryError={inventoryError}
+          />
         </div>
 
         {/* Execution controls — backend status is authoritative */}

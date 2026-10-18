@@ -97,6 +97,7 @@ export async function submitJob(payload) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
+        ship_id:      Number(payload.ship_id),
         job_id:       String(payload.job_id),
         arrival_time: Number(payload.arrival_time),
         work_total:   Number(payload.work_total),
@@ -180,7 +181,7 @@ export async function stepSimulation() {
 
 /**
  * GET /inventory — PostgreSQL-backed physical resource inventory.
- * Returns { terminals, berths, cranes } from the database.
+ * Returns { terminals, berths, cranes, ships } from the database.
  * Independent of the C++ simulation runtime state.
  */
 export async function fetchInventory() {

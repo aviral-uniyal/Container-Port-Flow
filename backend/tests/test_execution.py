@@ -336,11 +336,20 @@ def test_actual_cpp_bridge_step_and_run():
                  patch("backend.app.router.get_active_assignments_for_cranes", return_value=[]):
                 connection.return_value.__enter__.return_value = object()
                 assert client.post("/simulation/cranes", json={"crane_id": "C1"}).status_code == 200
+            client.app.state.current_run_id = 7
+            with patch("backend.app.router.get_connection") as connection, \
+                 patch("backend.app.router.ship_exists", return_value=True), \
+                 patch("backend.app.router.ship_has_job_in_run", return_value=False), \
+                 patch("backend.app.router.insert_simulation_job"), \
+                 patch("backend.app.router._persist_snapshot"):
+                client.app.state.db_pool = SimpleNamespace(is_open=True)
+                connection.return_value.__enter__.return_value = object()
+                assert client.post("/simulation/jobs", json={
+                    "ship_id": 1, "job_id": "J1", "arrival_time": 0, "work_total": 2,
+                    "priority": 1, "berths": 1, "cranes": 1, "trucks": 1,
+                }).status_code == 200
+            client.app.state.current_run_id = None
             client.app.state.db_pool = None
-            assert client.post("/simulation/jobs", json={
-                "job_id": "J1", "arrival_time": 0, "work_total": 2,
-                "priority": 1, "berths": 1, "cranes": 1, "trucks": 1,
-            }).status_code == 200
             assert client.post("/simulation/step").json()["advanced_jobs"] == []
             client.post("/simulation/run", json={"interval_seconds": 0.05})
             wait_for(client, "completed")
@@ -413,10 +422,17 @@ def test_startup_cleanup_runs_once_and_api_refresh_does_not_repeat_it():
 
     with patch("backend.app.main.CppBridge", return_value=bridge), \
          patch("backend.app.main.DatabasePool", return_value=Pool()), \
-         patch("backend.app.main.initialize_backend_inventory") as initialize:
+         patch("backend.app.main.initialize_backend_inventory") as initialize, \
+         patch("backend.app.router.get_resource_inventory", return_value={
+             "terminals": [], "berths": [], "cranes": [],
+             "ships": [{"ship_id": 1, "vessel_name": "A", "status": "NOT ARRIVED"}],
+         }) as inventory:
         with TestClient(main_app, raise_server_exceptions=False) as client:
             assert client.get("/simulation/execution").status_code == 200
             assert client.get("/simulation/execution").status_code == 200
+            assert client.get("/inventory").json()["ships"][0]["status"] == "NOT ARRIVED"
+            inventory.assert_called_once()
+            assert inventory.call_args.args[1] is None
             initialize.assert_called_once()
 
 
