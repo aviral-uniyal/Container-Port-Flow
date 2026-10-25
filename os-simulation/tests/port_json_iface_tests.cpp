@@ -376,6 +376,7 @@ private:
         if (!initialised) return err_resp("dispatcher not initialised");
         picojson::object r; r["ok"] = picojson::value(true);
         r["batch_mode"] = picojson::value(!dp->auto_dispatch());
+        r["simulation_time"] = picojson::value((double)dp->simulation_time());
         std::string pol_s = "FCFS";
         if (dp->policy() == DispatchPolicy::SJF) pol_s = "SJF";
         else if (dp->policy() == DispatchPolicy::PRIORITY) pol_s = "PRIORITY";
@@ -565,6 +566,29 @@ static bool t_register_crane_duplicate() {
     auto snap = sim.dispatch(R"({"cmd":"snapshot"})");
     auto& crarr = snap.at("cranes").get<picojson::array>();
     CHECK_EQ((int)crarr.size(), 1);
+    return true;
+}
+
+static bool t_register_crane_capacity() {
+    for (int capacity : {1, 3}) {
+        AdapterSim sim;
+        auto initialized = sim.dispatch(std::string("{\"cmd\":\"init\",\"berths\":1,\"cranes\":") +
+                                        std::to_string(capacity) + ",\"trucks\":3}");
+        CHECK(get_bool(initialized, "ok"));
+        for (int index = 1; index <= capacity; ++index) {
+            auto registered = sim.dispatch(std::string("{\"cmd\":\"register_crane\",\"crane_id\":\"C") +
+                                           std::to_string(index) + "\"}");
+            CHECK(get_bool(registered, "ok"));
+        }
+        auto rejected = sim.dispatch(R"({"cmd":"register_crane","crane_id":"EXTRA"})");
+        CHECK(!get_bool(rejected, "ok"));
+        CHECK(get_str(rejected, "error").find("Crane registration limit reached") != std::string::npos);
+        auto snapshot = sim.dispatch(R"({"cmd":"snapshot"})");
+        CHECK_EQ(snapshot.at("cranes").get<picojson::array>().size(),
+                 static_cast<size_t>(capacity));
+        CHECK_EQ(get_int(snapshot.at("resources").get<picojson::object>(), "total_cranes"),
+                 capacity);
+    }
     return true;
 }
 
@@ -799,6 +823,7 @@ static bool t_snapshot_empty() {
     sim.dispatch(R"({"cmd":"register_crane","crane_id":"C1"})");
     auto snap = sim.dispatch(R"({"cmd":"snapshot"})");
     CHECK(get_bool(snap, "ok"));
+    CHECK_EQ(get_int(snap, "simulation_time"), 0);
     auto& res = snap.at("resources").get<picojson::object>();
     CHECK_EQ(get_int(res, "total_berths"), 3);
     CHECK_EQ(get_int(res, "total_cranes"), 5);
@@ -928,9 +953,12 @@ static bool t_reinit_clears_state() {
     sim.dispatch(R"({"cmd":"init","berths":4,"cranes":4,"trucks":4})");
     sim.dispatch(R"({"cmd":"register_crane","crane_id":"C1"})");
     sim.dispatch(R"({"cmd":"submit_job","job_id":"J1","arrival_time":0,"work_total":10,"priority":1,"berths":1,"cranes":1,"trucks":0})");
+    sim.dispatch(R"({"cmd":"step"})");
+    CHECK_EQ(get_int(sim.dispatch(R"({"cmd":"snapshot"})"), "simulation_time"), 1);
     // Re-init
     sim.dispatch(R"({"cmd":"init","berths":2,"cranes":2,"trucks":2})");
     auto snap = sim.dispatch(R"({"cmd":"snapshot"})");
+    CHECK_EQ(get_int(snap, "simulation_time"), 0);
     // jobs should be empty (known_jobs cleared)
     auto& jobs = snap.at("jobs").get<picojson::array>();
     CHECK(jobs.empty());
@@ -1052,16 +1080,16 @@ static bool t_snapshot_job_metadata_fields() {
 
     // 3. Verify all existing fields remain intact with correct values
     CHECK_EQ(get_str(jo, "job_id"), "J1");
-    CHECK_EQ(get_str(jo, "state"), "ACTIVE");
+    CHECK_EQ(get_str(jo, "state"), "PENDING");
     CHECK_EQ(get_int(jo, "work_total"), 20);
     CHECK_EQ(get_int(jo, "work_remaining"), 20);
     CHECK_EQ(get_int(jo, "work_completed"), 0);
-    CHECK(get_bool(jo, "rm_allocated"));
+    CHECK(!get_bool(jo, "rm_allocated"));
     CHECK_EQ(get_int(jo, "required_cranes"), 2);
-    CHECK(get_bool(jo, "crane_fulfilled"));
-    CHECK(get_bool(jo, "can_complete"));
+    CHECK(!get_bool(jo, "crane_fulfilled"));
+    CHECK(!get_bool(jo, "can_complete"));
     auto& active_cranes = jo.at("active_cranes").get<picojson::array>();
-    CHECK_EQ(active_cranes.size(), (size_t)2);
+    CHECK_EQ(active_cranes.size(), (size_t)0);
 
     return true;
 }
@@ -1073,6 +1101,7 @@ static bool t_snapshot_job_metadata_lifecycle_invariant() {
     sim.dispatch(R"({"cmd":"register_crane","crane_id":"C1"})");
 
     // 1. ACTIVE state (J1 submitted and dispatched immediately with C1)
+    for (int t = 0; t < 7; ++t) sim.dispatch(R"({"cmd":"step"})");
     sim.dispatch(R"({"cmd":"submit_job","job_id":"J1","arrival_time":7,"work_total":10,"priority":2,"berths":1,"cranes":1,"trucks":1})");
     auto s1 = sim.dispatch(R"({"cmd":"snapshot"})");
     picojson::object j1_act;
@@ -1229,26 +1258,27 @@ static bool t_snapshot_queue_order_is_authoritative_and_deterministic() {
     CHECK_EQ(jobs2.size(), (size_t)3);
 
     const char* submitted[] = {"LONG", "SHORT_A", "SHORT_B"};
-    const int queue_positions[] = {3, 1, 2};
+    const int queue_positions[] = {0, 1, 0};
     for (size_t i = 0; i < jobs1.size(); ++i) {
         auto& a = jobs1[i].get<picojson::object>();
         auto& b = jobs2[i].get<picojson::object>();
         CHECK_EQ(get_str(a, "job_id"), std::string(submitted[i]));
         CHECK_EQ(get_str(b, "job_id"), std::string(submitted[i]));
         CHECK_EQ(get_int(a, "submission_seq"), static_cast<int>(i));
-        CHECK_EQ(get_int(a, "queue_position"), queue_positions[i]);
+        if (queue_positions[i]) CHECK_EQ(get_int(a, "queue_position"), queue_positions[i]);
+        else CHECK(a.find("queue_position") == a.end());
         CHECK(a.find("dispatch_sequence") == a.end());
     }
 
     auto dispatched = sim.dispatch(R"({"cmd":"dispatch_batch"})");
-    CHECK_EQ(get_int(dispatched, "count"), 2);
+    CHECK_EQ(get_int(dispatched, "count"), 1);
     auto after = sim.dispatch(R"({"cmd":"snapshot"})");
     auto& jobs3 = after.at("jobs").get<picojson::array>();
     for (auto& value : jobs3) {
         auto& job = value.get<picojson::object>();
         const std::string id = get_str(job, "job_id");
         if (id == "SHORT_A") CHECK_EQ(get_int(job, "dispatch_sequence"), 0);
-        if (id == "SHORT_B") CHECK_EQ(get_int(job, "dispatch_sequence"), 1);
+        if (id == "SHORT_B") CHECK(job.find("dispatch_sequence") == job.end());
         if (id == "LONG") CHECK(job.find("dispatch_sequence") == job.end());
     }
     return true;
@@ -1488,6 +1518,7 @@ static bool t_actual_binary_step_subprocess() {
     CHECK_EQ(static_cast<int>(responses.size()), 6);
     CHECK_EQ(responses[3].at("advanced_jobs").get<picojson::array>()[0].get<std::string>(), "J1");
     CHECK_EQ(responses[3].at("completed_jobs").get<picojson::array>()[0].get<std::string>(), "J1");
+    CHECK_EQ(get_int(responses[4], "simulation_time"), 1);
     auto& job = responses[4].at("jobs").get<picojson::array>()[0].get<picojson::object>();
     CHECK_EQ(get_str(job, "state"), "COMPLETED");
     CHECK_EQ(get_int(job, "work_remaining"), 0);
@@ -1504,6 +1535,7 @@ int main() {
     run_test("init_negative_berths",            t_init_negative_berths);
     run_test("init_success",                    t_init_success);
     run_test("register_crane_duplicate",        t_register_crane_duplicate);
+    run_test("register_crane_capacity",         t_register_crane_capacity);
     run_test("submit_job_dispatches",           t_submit_job_dispatches);
     run_test("submit_job_pending",              t_submit_job_pending);
     run_test("duplicate_job_id",               t_duplicate_job_id);

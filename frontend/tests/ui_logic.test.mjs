@@ -14,12 +14,14 @@ let dispatchFeedback
 let blockedExecutionFeedback
 let executionStatusLabel
 let stabilizeJobOrder
+let insertJobOrder
+let previewJobOrder
 let stepFeedback
 
 before(async () => {
   server = await createServer({ server: { middlewareMode: true }, appType: 'custom' })
   ;({ blockedExecutionFeedback, dispatchFeedback, executionStatusLabel,
-    stabilizeJobOrder, stepFeedback } =
+    insertJobOrder, previewJobOrder, stabilizeJobOrder, stepFeedback } =
     await server.ssrLoadModule('/src/uiLogic.js'))
   ;({ default: App } = await server.ssrLoadModule('/src/App.jsx'))
   ;({ default: JobsTable } = await server.ssrLoadModule('/src/components/JobsTable.jsx'))
@@ -32,71 +34,53 @@ after(async () => {
 
 const ids = result => result.jobs.map(job => job.job_id)
 
-test('FCFS, SJF, and Priority retain authoritative dispatch order through completion', () => {
-  for (const { first, second } of [
-    { first: 'FCFS_001', second: 'FCFS_002' },
-    { first: 'SJF_002', second: 'SJF_001' },
-    { first: 'PRIORITY_002', second: 'PRIORITY_001' },
-  ]) {
-    const queued = [
-      { job_id: second, state: 'PENDING', submission_seq: 0, queue_position: 2 },
-      { job_id: first, state: 'PENDING', submission_seq: 1, queue_position: 1 },
-    ]
-    assert.deepEqual(ids(stabilizeJobOrder(queued)), [first, second])
-
-    const firstRunning = queued.map(job => job.job_id === first
-      ? { ...job, state: 'ACTIVE', queue_position: undefined, dispatch_sequence: 0 }
-      : job)
-    assert.deepEqual(ids(stabilizeJobOrder(firstRunning)), [first, second])
-
-    const bothFinished = firstRunning.map(job => job.job_id === first
-      ? { ...job, state: 'COMPLETED' }
-      : { ...job, state: 'COMPLETED', queue_position: undefined, dispatch_sequence: 1 })
-    assert.deepEqual(ids(stabilizeJobOrder(bothFinished)), [first, second])
-    assert.deepEqual(ids(stabilizeJobOrder([...bothFinished].reverse())), [first, second])
-  }
+test('FCFS inserts earlier arrival immediately and preserves submission ties', () => {
+  const first = { job_id: 'JOB_001', arrival_time: 5, submission_seq: 0, work_total: 2 }
+  const second = { job_id: 'JOB_002', arrival_time: 3, submission_seq: 1, work_total: 2 }
+  assert.deepEqual(insertJobOrder(['JOB_001'], [first], second, 'FCFS'), ['JOB_002', 'JOB_001'])
+  assert.deepEqual(previewJobOrder([first, { ...second, arrival_time: 5 }], 'FCFS'),
+    ['JOB_001', 'JOB_002'])
 })
 
-test('failure, interruption, and recovery do not move a dispatched job', () => {
-  for (const state of ['ACTIVE', 'INTERRUPTED', 'ACTIVE', 'COMPLETED']) {
-    const jobs = [
-      { job_id: 'WAITING', state: 'PENDING', submission_seq: 0, queue_position: 1 },
-      { job_id: 'FIRST', state, submission_seq: 1, dispatch_sequence: 0 },
-    ]
-    assert.deepEqual(ids(stabilizeJobOrder(jobs)), ['FIRST', 'WAITING'])
-  }
-})
-
-test('concurrent dispatch and reload ordering are deterministic', () => {
-  const snapshot = [
-    { job_id: 'THIRD', state: 'ACTIVE', submission_seq: 0, dispatch_sequence: 2 },
-    { job_id: 'FIRST', state: 'ACTIVE', submission_seq: 2, dispatch_sequence: 0 },
-    { job_id: 'SECOND', state: 'ACTIVE', submission_seq: 1, dispatch_sequence: 1 },
+test('SJF and Priority choose among arrived jobs at submission', () => {
+  const jobs = [
+    { job_id: 'A', arrival_time: 0, work_total: 3, priority: 3, submission_seq: 0 },
+    { job_id: 'B', arrival_time: 1, work_total: 8, priority: 2, submission_seq: 1 },
+    { job_id: 'C', arrival_time: 2, work_total: 1, priority: 1, submission_seq: 2 },
   ]
-  const expected = ['FIRST', 'SECOND', 'THIRD']
-  assert.deepEqual(ids(stabilizeJobOrder(snapshot)), expected)
-  assert.deepEqual(ids(stabilizeJobOrder([...snapshot].reverse())), expected)
+  assert.deepEqual(previewJobOrder(jobs, 'SJF'), ['A', 'C', 'B'])
+  assert.deepEqual(previewJobOrder(jobs, 'PRIORITY'), ['A', 'C', 'B'])
+  assert.deepEqual(insertJobOrder(['A', 'B'], jobs.slice(0, 2), jobs[2], 'SJF'), ['A', 'C', 'B'])
+  assert.deepEqual(insertJobOrder(['A', 'B'], jobs.slice(0, 2), jobs[2], 'PRIORITY'), ['A', 'C', 'B'])
 })
 
-test('later submissions never rewrite established execution history', () => {
-  const result = stabilizeJobOrder([
-    { job_id: 'COMPLETED_FIRST', state: 'COMPLETED', submission_seq: 0, dispatch_sequence: 0 },
-    { job_id: 'LATER_HIGH', state: 'PENDING', submission_seq: 2, queue_position: 1 },
-    { job_id: 'EARLIER_LOW', state: 'PENDING', submission_seq: 1, queue_position: 2 },
-  ])
-  assert.deepEqual(ids(result), ['COMPLETED_FIRST', 'LATER_HIGH', 'EARLIER_LOW'])
+test('execution snapshots, interruption, polling, Refresh, and completion preserve rows', () => {
+  const order = ['B', 'A']
+  for (const state of ['PENDING', 'ACTIVE', 'INTERRUPTED', 'COMPLETED']) {
+    const snapshot = [
+      { job_id: 'A', state, queue_position: 1, dispatch_sequence: 0, work_remaining: 0 },
+      { job_id: 'B', state, queue_position: 2, dispatch_sequence: 1, work_remaining: 9 },
+    ]
+    assert.deepEqual(stabilizeJobOrder(snapshot, order).order, order)
+    assert.deepEqual(stabilizeJobOrder([...snapshot].reverse(), order).order, order)
+  }
 })
 
-test('missing and malformed queue positions use deterministic fallbacks', () => {
-  const result = stabilizeJobOrder([
-    { job_id: 'STRING_POSITION', state: 'PENDING', submission_seq: 3, queue_position: '1' },
-    { job_id: 'NEGATIVE_POSITION', state: 'PENDING', submission_seq: 2, queue_position: -1 },
-    { job_id: 'NO_POSITION', state: 'PENDING', submission_seq: 1 },
-    { job_id: 'VALID_POSITION', state: 'PENDING', submission_seq: 9, queue_position: 2 },
-  ])
-  assert.deepEqual(ids(result), [
-    'VALID_POSITION', 'NO_POSITION', 'NEGATIVE_POSITION', 'STRING_POSITION',
-  ])
+test('new submission inserts without changing relative positions of existing rows', () => {
+  const jobs = [
+    { job_id: 'A', arrival_time: 5, submission_seq: 0, work_total: 2 },
+    { job_id: 'B', arrival_time: 3, submission_seq: 1, work_total: 2 },
+  ]
+  const next = insertJobOrder(['B', 'A'], jobs,
+    { job_id: 'C', arrival_time: 4, submission_seq: 2, work_total: 1 }, 'FCFS')
+  assert.deepEqual(next, ['B', 'C', 'A'])
+})
+
+test('a temporarily incomplete snapshot cannot erase established positions', () => {
+  const partial = stabilizeJobOrder([{ job_id: 'A' }], ['B', 'A'])
+  assert.deepEqual(partial.order, ['B', 'A'])
+  assert.deepEqual(stabilizeJobOrder([{ job_id: 'A' }, { job_id: 'B' }], partial.order).order,
+    ['B', 'A'])
 })
 
 test('Jobs table explains scheduling and only queued jobs show queue positions', () => {
@@ -106,12 +90,13 @@ test('Jobs table explains scheduling and only queued jobs show queue positions',
     { job_id: 'RUNNING', state: 'ACTIVE', submission_seq: 2, priority: 2, crane_fulfilled: true, dispatch_sequence: 0 },
     { job_id: 'DAMAGED', state: 'ACTIVE', submission_seq: 3, priority: 3, crane_fulfilled: false, dispatch_sequence: 1 },
     { job_id: 'STOPPED', state: 'INTERRUPTED', submission_seq: 4, priority: 4, crane_fulfilled: false, dispatch_sequence: 2 },
-  ]).jobs
+  ], ['RUNNING', 'DAMAGED', 'STOPPED', 'DONE', 'WAITING']).jobs
   const html = renderToStaticMarkup(React.createElement(JobsTable, { jobs: ordered }))
   assert.match(html, /Queue Position/)
+  assert.match(html, /Arrival Time/)
   assert.match(html, /Crane Supply/)
-  assert.match(html, /Queued jobs follow the selected scheduling policy/)
-  assert.match(html, /Rows retain first-dispatch order/)
+  assert.match(html, /Jobs are placed by the selected scheduling policy when submitted/)
+  assert.match(html, /Rows keep their positions/)
   assert.match(html, /State and crane supply are shown separately/)
   assert.match(html, /FULLY SUPPLIED/)
   assert.equal((html.match(/UNDER-SUPPLIED/g) ?? []).length, 2)
@@ -120,11 +105,25 @@ test('Jobs table explains scheduling and only queued jobs show queue positions',
   assert.match(html, /WAITING[\s\S]*?<td>1<\/td>/)
 })
 
+test('dashboard omits the simulation-time display while retaining clock-based feedback', async () => {
+  const html = renderToStaticMarkup(React.createElement(App))
+  const source = await readFile(new URL('../src/App.jsx', import.meta.url), 'utf8')
+  const css = await readFile(new URL('../src/index.css', import.meta.url), 'utf8')
+  assert.doesNotMatch(html, /Simulation Time:/)
+  assert.doesNotMatch(source, /setSimulationTime|simulation-time|Simulation Time:/)
+  assert.doesNotMatch(css, /\.simulation-time\b/)
+  assert.match(source, /snapshotResult\.data\.simulation_time/)
+})
+
 test('Dispatch All feedback distinguishes empty, waiting, and success', () => {
   assert.equal(dispatchFeedback({ pendingJobs: 0 }).message, 'No pending jobs to dispatch.')
   assert.equal(
     dispatchFeedback({ pendingJobs: 2 }).message,
     'Pending jobs are waiting for available resources.',
+  )
+  assert.equal(
+    dispatchFeedback({ pendingJobs: 2, futureJobs: 2 }).message,
+    'Pending jobs are waiting for their arrival time.',
   )
   assert.equal(
     dispatchFeedback({ count: 2, dispatchedJobs: ['J1', 'J2'], pendingJobs: 0 }).message,
@@ -157,6 +156,8 @@ test('Dispatch All requests dispatch without announcing automatic completion', a
 })
 
 test('Step feedback reports progress, completion, batch no-op, and resource blocking', () => {
+  assert.match(stepFeedback({}, [{ state: 'PENDING', arrival_time: 5 }], false, 1).message,
+    /waiting for the next job arrival/)
   assert.match(stepFeedback({ advanced_jobs: ['J1'] }).message, /advanced 1 active job/)
   assert.match(stepFeedback({ completed_jobs: ['J1'] }).message, /Finished: J1/)
   assert.match(

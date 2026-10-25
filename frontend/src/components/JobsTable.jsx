@@ -61,14 +61,15 @@ export default function JobsTable({ jobs = [], onComplete, onDispatch, batchMode
         )}
       </div>
       <p className="jobs-table__hint">
-        Queued jobs follow the selected scheduling policy. Rows retain first-dispatch order as job
-        states change. State and crane supply are shown separately.
+        Jobs are placed by the selected scheduling policy when submitted. Rows keep their positions
+        as job states change. State and crane supply are shown separately.
       </p>
       <div className="table-wrapper">
         <table className="table" aria-label="Simulation jobs list">
           <thead>
             <tr>
               <th scope="col">Job ID</th>
+              <th scope="col">Arrival Time</th>
               <th scope="col">State</th>
               <th scope="col">Crane Supply</th>
               <th scope="col">Queue Position</th>
@@ -82,7 +83,7 @@ export default function JobsTable({ jobs = [], onComplete, onDispatch, batchMode
           <tbody>
             {jobs.length === 0 ? (
               <tr>
-                <td colSpan={9}>
+                <td colSpan={10}>
                   <div className="empty-state">
                     <div className="empty-state__icon">📋</div>
                     No jobs submitted yet. Use the Job Management form to submit a job.
@@ -97,6 +98,7 @@ export default function JobsTable({ jobs = [], onComplete, onDispatch, batchMode
                       {job.job_id}
                     </code>
                   </td>
+                  <td>{job.arrival_time ?? '—'}</td>
                   <td>
                     <span className={STATE_BADGE[job.state] ?? 'badge'}>
                       {job.state}

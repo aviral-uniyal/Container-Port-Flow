@@ -406,7 +406,8 @@ def simulation_register_crane(body: CraneRegisterRequest, request: Request):
         raise HTTPException(status_code=503, detail="C++ simulation bridge is unavailable")
     if not resp.get("ok", False):
         error = resp.get("error", "C++ command rejected")
-        code = 409 if "duplicate crane" in error.lower() else 400
+        code = 409 if ("duplicate crane" in error.lower()
+                       or "crane registration limit" in error.lower()) else 400
         raise HTTPException(status_code=code, detail=error)
     return resp
 

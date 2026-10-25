@@ -133,6 +133,43 @@ def test_step_forwarding_and_batch_authorization():
         assert any(c == {"cmd": "step", "continue_batch": True} for c in bridge.commands)
 
 
+def test_runner_advances_through_future_arrival_without_blocking():
+    class FutureArrivalBridge:
+        def __init__(self):
+            self.time = 0
+            self.job = {"job_id": "FUTURE", "arrival_time": 3, "state": "PENDING"}
+
+        def send(self, command):
+            if command["cmd"] == "snapshot":
+                return {"ok": True, "simulation_time": self.time,
+                        "jobs": [self.job.copy()]}
+            assert command == {"cmd": "step", "continue_batch": True}
+            advanced, dispatched = [], []
+            if self.job["state"] == "ACTIVE":
+                advanced.append("FUTURE")
+                self.job["state"] = "COMPLETED"
+            self.time += 1
+            if self.time == 3:
+                self.job["state"] = "ACTIVE"
+                dispatched.append("FUTURE")
+            return {"ok": True, "advanced_jobs": advanced,
+                    "dispatched_jobs": dispatched}
+
+    async def scenario():
+        bridge = FutureArrivalBridge()
+        execution = SimulationExecution(bridge)
+        await execution.run(0.05)
+        for _ in range(100):
+            if execution.state != "running":
+                break
+            await asyncio.sleep(0.01)
+        assert execution.state == "completed"
+        assert bridge.time == 4
+        assert bridge.job["state"] == "COMPLETED"
+
+    asyncio.run(scenario())
+
+
 def test_initial_and_manual_step_status_are_not_running():
     bridge = WorkBridge(work=(2,))
     with client_for(bridge) as client:

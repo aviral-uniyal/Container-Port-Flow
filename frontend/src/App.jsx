@@ -10,6 +10,8 @@ import {
   blockedExecutionFeedback,
   dispatchFeedback,
   executionStatusLabel,
+  insertJobOrder,
+  stabilizeCraneOrder,
   stabilizeJobOrder,
   stepFeedback,
 } from './uiLogic'
@@ -66,6 +68,10 @@ export default function App() {
   const executionRequestRef = useRef(0)
   const executionStateRef = useRef('not_running')
   const runRequestRef = useRef(false)
+  const jobOrderRef = useRef([])
+  const craneOrderRef = useRef([])
+  const jobMetadataRef = useRef(new Map())
+  const policyRef = useRef('FCFS')
 
   /* ── Helper: set loading flag for a given action key ── */
   function setBusy(key, busy) {
@@ -83,15 +89,23 @@ export default function App() {
       })
     }
     if (Array.isArray(data.jobs)) {
-      setJobs(stabilizeJobOrder(data.jobs).jobs)
+      for (const job of data.jobs) {
+        if (!jobMetadataRef.current.has(job.job_id)) jobMetadataRef.current.set(job.job_id, job)
+      }
+      const stable = stabilizeJobOrder(data.jobs, jobOrderRef.current)
+      jobOrderRef.current = stable.order
+      setJobs(stable.jobs)
     }
     if (Array.isArray(data.cranes)) {
-      setCranes(data.cranes.map(c => ({
+      const stable = stabilizeCraneOrder(data.cranes.map(c => ({
         crane_id:        c.crane_id,
         status:          c.status,
         assigned_job_id: c.assigned_job || null,
-      })))
+      })), craneOrderRef.current)
+      craneOrderRef.current = stable.order
+      setCranes(stable.cranes)
     }
+    if (data.policy) policyRef.current = data.policy
     if (typeof data.batch_mode === 'boolean') {
       setBatchMode(data.batch_mode)
     }
@@ -130,11 +144,13 @@ export default function App() {
   }, [])
 
   /* ── Refresh PostgreSQL inventory ── */
-  const refreshInventory = useCallback(async () => {
-    setInventoryLoading(true)
-    setInventoryError(null)
+  const refreshInventory = useCallback(async ({ silent = false } = {}) => {
+    if (!silent) {
+      setInventoryLoading(true)
+      setInventoryError(null)
+    }
     const result = await fetchInventory()
-    setInventoryLoading(false)
+    if (!silent) setInventoryLoading(false)
     if (result.ok && Array.isArray(result.data?.ships)) {
       setInventory(result.data)
     } else {
@@ -154,7 +170,7 @@ export default function App() {
       if (cancelled) return
       const statusResult = await refreshExecution({ announce: true })
       if (cancelled) return
-      await refreshInventory()
+      await refreshInventory({ silent: true })
       if (cancelled) return
       if (statusResult.ok && statusResult.data.state === 'running') {
         timerId = window.setTimeout(poll, 1000)
@@ -214,6 +230,13 @@ export default function App() {
       setFeedback({ message: `Init failed: ${result.error}`, severity: 'err' })
       return
     }
+    snapshotRequestRef.current += 1
+    jobOrderRef.current = []
+    craneOrderRef.current = []
+    jobMetadataRef.current = new Map()
+    policyRef.current = result.data.policy || formData.policy || 'FCFS'
+    setJobs([])
+    setCranes([])
     // Read batch_mode from the C++ response (authoritative source).
     const isBatch = result.data.batch_mode === true
     setBatchMode(isBatch)
@@ -275,7 +298,8 @@ export default function App() {
     const [snapshotResult] = await Promise.all([refreshSnapshot(), refreshExecution()])
     await refreshInventory()
     const snapshotJobs = snapshotResult.ok ? (snapshotResult.data.jobs ?? []) : jobs
-    setFeedback(stepFeedback(result.data, snapshotJobs, batchMode))
+    setFeedback(stepFeedback(result.data, snapshotJobs, batchMode,
+      snapshotResult.ok ? snapshotResult.data.simulation_time : null))
   }
 
   /* ── Dispatch all queued jobs (batch mode only) ── */
@@ -291,9 +315,13 @@ export default function App() {
     const count = result.data.count ?? 0
     const dispatchedJobs = result.data.dispatched_jobs ?? []
     const snapshotResult = await refreshSnapshot()
-    const pendingJobs = (snapshotResult.ok ? snapshotResult.data.jobs ?? [] : jobs)
-      .filter(job => job.state === 'PENDING').length
-    setFeedback(dispatchFeedback({ count, dispatchedJobs, pendingJobs }))
+    const pending = (snapshotResult.ok ? snapshotResult.data.jobs ?? [] : jobs)
+      .filter(job => job.state === 'PENDING')
+    const pendingJobs = pending.length
+    const futureJobs = pending.filter(job =>
+      Number.isInteger(snapshotResult.data?.simulation_time) &&
+      job.arrival_time > snapshotResult.data.simulation_time).length
+    setFeedback(dispatchFeedback({ count, dispatchedJobs, pendingJobs, futureJobs }))
     await refreshExecution()
     await refreshInventory()
   }
@@ -308,6 +336,19 @@ export default function App() {
       await Promise.all([refreshSnapshot(), refreshExecution(), refreshInventory()])
       return false
     }
+    snapshotRequestRef.current += 1
+    const newJob = {
+      ...formData,
+      submission_seq: jobMetadataRef.current.size,
+      state: 'PENDING',
+      work_completed: 0,
+      work_remaining: formData.work_total,
+    }
+    const nextOrder = insertJobOrder(jobOrderRef.current,
+      [...jobMetadataRef.current.values()], newJob, policyRef.current)
+    jobOrderRef.current = nextOrder
+    jobMetadataRef.current.set(newJob.job_id, newJob)
+    setJobs(previous => stabilizeJobOrder([...previous, newJob], nextOrder).jobs)
     setFeedback({
       message: `Job "${formData.job_id}" submitted successfully.`,
       severity: 'ok',
@@ -350,6 +391,13 @@ export default function App() {
       await Promise.all([refreshSnapshot(), refreshExecution(), refreshInventory()])
       return
     }
+    snapshotRequestRef.current += 1
+    if (!craneOrderRef.current.includes(craneId)) {
+      craneOrderRef.current = [...craneOrderRef.current, craneId]
+    }
+    setCranes(previous => stabilizeCraneOrder([
+      ...previous, { crane_id: craneId, status: 'AVAILABLE', assigned_job_id: null },
+    ], craneOrderRef.current).cranes)
     setFeedback({
       message: `Crane "${craneId}" registered successfully.`,
       severity: 'ok',
@@ -534,6 +582,7 @@ export default function App() {
         {/* Crane Registry — full width */}
         <CraneRegistry
           cranes={cranes}
+          capacity={resources?.cranes.total}
           inventory={inventory}
           onRegister={handleCraneRegister}
           onFail={handleCraneFail}

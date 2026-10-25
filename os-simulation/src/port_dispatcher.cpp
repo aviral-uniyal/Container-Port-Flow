@@ -23,7 +23,18 @@ PortDispatcher::PortDispatcher(int total_berths,
 // ─── Crane registration ────────────────────────────────────────────────────────
 
 void PortDispatcher::register_crane(const std::string& crane_id) {
-    registry_.register_crane(crane_id);  // throws on duplicate / empty
+    if (crane_id.empty()) {
+        throw std::invalid_argument("Crane ID must not be empty.");
+    }
+    if (registry_.has_crane(crane_id)) {
+        throw std::invalid_argument("Duplicate crane ID: " + crane_id);
+    }
+    const int capacity = rm_.total_capacity().cranes;
+    if (registry_.total_cranes() >= capacity) {
+        throw std::invalid_argument("Crane registration limit reached (capacity " +
+                                    std::to_string(capacity) + ").");
+    }
+    registry_.register_crane(crane_id);
 }
 
 // ─── Internal helpers ──────────────────────────────────────────────────────────
@@ -104,8 +115,10 @@ bool PortDispatcher::queue_precedes(const std::string& a,
 
     switch (policy_) {
         case DispatchPolicy::FCFS:
-            // Primary: interrupted first.  Secondary: submission order.
+            // Interrupted work retains precedence; FCFS uses arrival order.
             if (a_interrupted != b_interrupted) return a_interrupted > b_interrupted;
+            if (ra.job.arrival_time != rb.job.arrival_time)
+                return ra.job.arrival_time < rb.job.arrival_time;
             return ra.submission_seq < rb.submission_seq;
 
         case DispatchPolicy::SJF:
@@ -114,6 +127,8 @@ bool PortDispatcher::queue_precedes(const std::string& a,
             if (a_interrupted != b_interrupted) return a_interrupted > b_interrupted;
             if (ra.work_remaining != rb.work_remaining)
                 return ra.work_remaining < rb.work_remaining;
+            if (ra.job.arrival_time != rb.job.arrival_time)
+                return ra.job.arrival_time < rb.job.arrival_time;
             return ra.submission_seq < rb.submission_seq;
 
         case DispatchPolicy::PRIORITY:
@@ -122,6 +137,8 @@ bool PortDispatcher::queue_precedes(const std::string& a,
             if (a_interrupted != b_interrupted) return a_interrupted > b_interrupted;
             if (ra.job.priority != rb.job.priority)
                 return ra.job.priority < rb.job.priority;
+            if (ra.job.arrival_time != rb.job.arrival_time)
+                return ra.job.arrival_time < rb.job.arrival_time;
             return ra.submission_seq < rb.submission_seq;
     }
     return false; // unreachable
@@ -200,6 +217,7 @@ std::string PortDispatcher::try_dispatch_pending() {
         const std::string& jid = pending_queue_[qi];
         JobRecord& rec = job_records_.at(jid);
         if (rec.state != JobState::PENDING) continue;
+        if (rec.job.arrival_time > simulation_time_) continue;
 
         const PortJob& job = rec.job;
 
@@ -552,6 +570,13 @@ StepResult PortDispatcher::step(bool continue_batch) {
         result.completed_job_ids.push_back(job_id);
     }
 
+    // The jobs captured above worked during [t, t+1). New arrivals become
+    // eligible at t+1, without receiving work in this step.
+    ++simulation_time_;
+    if (auto_dispatch_) {
+        flush_dispatch();
+    }
+
     // Per-operation authorization for a future Run controller. A normal step
     // leaves fresh batch jobs queued; continue_batch explicitly drains all jobs
     // that fit after this step's work and completions.
@@ -608,7 +633,14 @@ const JobRecord& PortDispatcher::job_record(const std::string& job_id) const {
 }
 
 std::vector<std::string> PortDispatcher::ordered_queue() const {
-    std::vector<std::string> ordered(pending_queue_.begin(), pending_queue_.end());
+    // Queue positions represent jobs currently eligible for dispatch. Future
+    // arrivals remain PENDING but have no current queue position.
+    std::vector<std::string> ordered;
+    for (const auto& jid : pending_queue_) {
+        const JobRecord& rec = job_records_.at(jid);
+        if (rec.state == JobState::INTERRUPTED ||
+            rec.job.arrival_time <= simulation_time_) ordered.push_back(jid);
+    }
     std::stable_sort(ordered.begin(), ordered.end(),
         [this](const std::string& a, const std::string& b) {
             return queue_precedes(a, b);

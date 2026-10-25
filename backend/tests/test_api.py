@@ -343,6 +343,17 @@ class TestCraneRegistration:
         )
         assert resp.status_code == 422
 
+    def test_register_crane_capacity_conflict(self):
+        fake = FakeBridge(response={
+            "ok": False,
+            "error": "Crane registration limit reached (capacity 1).",
+        })
+        client = _client(fake)
+        with patch("backend.app.router.get_crane", return_value={"crane_id": "C2", "status": "AVAILABLE"}):
+            resp = client.post("/simulation/cranes", json={"crane_id": "C2"})
+        assert resp.status_code == 409
+        assert "capacity 1" in resp.json()["detail"]
+
 
 # ─── POST /simulation/jobs ───────────────────────────────────────────────────
 

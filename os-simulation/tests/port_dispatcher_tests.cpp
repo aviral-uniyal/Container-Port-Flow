@@ -140,7 +140,7 @@ static bool test_submit_stays_pending_insufficient_rm() {
     ASSERT_TRUE(pd.job_state("J1") == JobState::ACTIVE);
 
     // Second job cannot be dispatched.
-    pd.register_crane("C2");  // physical crane exists, but RM crane count is 0
+    // RM and the only registered crane are occupied by J1.
     pd.submit_job(make_job("J2", 1, 50, 5, 1, 1, 1));
     ASSERT_TRUE(pd.job_state("J2") == JobState::PENDING);
     return true;
@@ -150,7 +150,6 @@ static bool test_submit_stays_pending_insufficient_rm() {
 static bool test_complete_job_frees_and_dispatches() {
     PortDispatcher pd(1, 1, 1, DispatchPolicy::FCFS);
     pd.register_crane("C1");
-    pd.register_crane("C2");
 
     pd.submit_job(make_job("J1"));  // uses C1
     pd.submit_job(make_job("J2"));  // waits (RM cranes exhausted)
@@ -400,7 +399,7 @@ static bool test_failed_crane_not_assignable_before_recovery() {
     // Submitting J2 must NOT assign C1 (it's FAILED).
     // Interrupted J1 has priority and resumes on C2.
     // J2 stays PENDING because failed C1 cannot be allocated before recovery.
-    pd.submit_job(make_job("J2", 1, 50));
+    pd.submit_job(make_job("J2", 0, 50));
 
     ASSERT_TRUE(pd.job_state("J1") == JobState::ACTIVE);
     ASSERT_TRUE(pd.job_state("J2") == JobState::PENDING);
@@ -861,8 +860,8 @@ static bool test_fcfs_ordering_consistent_with_batch_fcfs() {
     pd.register_crane("C3");
 
     pd.submit_job(make_job("J1", 0, 50));   // seq 0, dispatched immediately
-    pd.submit_job(make_job("J2", 1, 100));  // seq 1, pending
-    pd.submit_job(make_job("J3", 2, 75));   // seq 2, pending
+    pd.submit_job(make_job("J2", 0, 100));  // seq 1, pending
+    pd.submit_job(make_job("J3", 0, 75));   // seq 2, pending
 
     ASSERT_TRUE(pd.job_state("J1") == JobState::ACTIVE);
 
@@ -1207,7 +1206,7 @@ static bool test_batch_flush_dispatch_fcfs() {
     pd.register_crane("C2");
 
     pd.submit_job(make_job("J1", 0, 50, 5, 1, 1, 1));
-    pd.submit_job(make_job("J2", 1, 30, 1, 1, 1, 1));
+    pd.submit_job(make_job("J2", 0, 30, 1, 1, 1, 1));
 
     std::vector<std::string> dispatched = pd.flush_dispatch();
     ASSERT_EQ(static_cast<int>(dispatched.size()), 2);
@@ -1228,8 +1227,8 @@ static bool test_batch_flush_dispatch_sjf() {
     pd.register_crane("C1");
 
     pd.submit_job(make_job("J_LONG",  0, 100, 1, 1, 1, 1));
-    pd.submit_job(make_job("J_SHORT", 1,  20, 5, 1, 1, 1));
-    pd.submit_job(make_job("J_MED",   2,  50, 3, 1, 1, 1));
+    pd.submit_job(make_job("J_SHORT", 0,  20, 5, 1, 1, 1));
+    pd.submit_job(make_job("J_MED",   0,  50, 3, 1, 1, 1));
 
     // Only 1 crane/berth/truck available -> only shortest should be dispatched
     std::vector<std::string> dispatched = pd.flush_dispatch();
@@ -1249,8 +1248,8 @@ static bool test_batch_flush_dispatch_priority() {
     pd.register_crane("C1");
 
     pd.submit_job(make_job("J_LOW",  0, 10, 10, 1, 1, 1));
-    pd.submit_job(make_job("J_HIGH", 1, 50,  1, 1, 1, 1));
-    pd.submit_job(make_job("J_MED",  2, 30,  5, 1, 1, 1));
+    pd.submit_job(make_job("J_HIGH", 0, 50,  1, 1, 1, 1));
+    pd.submit_job(make_job("J_MED",  0, 30,  5, 1, 1, 1));
 
     std::vector<std::string> dispatched = pd.flush_dispatch();
     ASSERT_EQ(static_cast<int>(dispatched.size()), 1);
@@ -1271,7 +1270,7 @@ static bool test_ordered_queue_matches_live_policy() {
         pd.submit_job(make_job("F1", 50, 30, 9));
         pd.submit_job(make_job("F2", 0, 10, 1));
         auto queue = pd.ordered_queue();
-        ASSERT_TRUE(queue == std::vector<std::string>({"F1", "F2"}));
+        ASSERT_TRUE(queue == std::vector<std::string>({"F2"}));
     }
     {
         PortDispatcher pd(3, 3, 3, DispatchPolicy::SJF);
@@ -1306,7 +1305,7 @@ static bool test_dispatch_sequence_preserves_policy_history() {
         pd.set_auto_dispatch(false);
         pd.register_crane("C1");
         pd.submit_job(make_job("JOB_001", 0, 10, 3, 1, 1, 1));
-        pd.submit_job(make_job("JOB_002", 1, 4, 1, 1, 1, 1));
+        pd.submit_job(make_job("JOB_002", 0, 4, 1, 1, 1, 1));
 
         const std::string expected_first =
             policy == DispatchPolicy::FCFS ? "JOB_001" : "JOB_002";
@@ -1336,8 +1335,8 @@ static bool test_concurrent_dispatch_sequence_is_deterministic() {
     pd.register_crane("C1");
     pd.register_crane("C2");
     pd.submit_job(make_job("LOW", 0, 10, 3, 1, 1, 1));
-    pd.submit_job(make_job("HIGH_FIRST", 1, 10, 1, 1, 1, 1));
-    pd.submit_job(make_job("HIGH_SECOND", 2, 10, 1, 1, 1, 1));
+    pd.submit_job(make_job("HIGH_FIRST", 0, 10, 1, 1, 1, 1));
+    pd.submit_job(make_job("HIGH_SECOND", 0, 10, 1, 1, 1, 1));
 
     ASSERT_TRUE(pd.flush_dispatch() ==
                 std::vector<std::string>({"HIGH_FIRST", "HIGH_SECOND"}));
@@ -1414,7 +1413,7 @@ static bool test_batch_complete_job_no_pending_autodispatch() {
 
     // Switch to batch mode and submit J2
     pd.set_auto_dispatch(false);
-    pd.submit_job(make_job("J2", 1, 50, 1, 1, 1, 1));
+    pd.submit_job(make_job("J2", 0, 50, 1, 1, 1, 1));
     ASSERT_TRUE(pd.job_state("J2") == JobState::PENDING);
 
     // Complete J1 -> in normal mode J2 would auto-dispatch, but in batch mode
@@ -1524,13 +1523,14 @@ static bool test_step_advances_all_eligible_active_jobs() {
     pd.submit_job(make_job("J3", 2, 4, 1, 1, 1, 1));
 
     StepResult result = pd.step();
-    ASSERT_TRUE(result.advanced_job_ids == std::vector<std::string>({"J1", "J2"}));
+    ASSERT_EQ(pd.simulation_time(), 1);
+    ASSERT_TRUE(result.advanced_job_ids == std::vector<std::string>({"J1"}));
     ASSERT_TRUE(result.completed_job_ids.empty());
-    ASSERT_TRUE(result.dispatched_job_ids.empty());
+    ASSERT_TRUE(result.dispatched_job_ids == std::vector<std::string>({"J2"}));
     ASSERT_EQ(pd.job_record("J1").work_completed, 1);
     ASSERT_EQ(pd.job_record("J1").work_remaining, 2);
-    ASSERT_EQ(pd.job_record("J2").work_completed, 1);
-    ASSERT_EQ(pd.job_record("J2").work_remaining, 1);
+    ASSERT_EQ(pd.job_record("J2").work_completed, 0);
+    ASSERT_EQ(pd.job_record("J2").work_remaining, 2);
     ASSERT_EQ(pd.job_record("J3").work_completed, 0);
     ASSERT_EQ(pd.job_record("J3").work_remaining, 4);
     ASSERT_TRUE(pd.job_state("J3") == JobState::PENDING);
@@ -1674,6 +1674,95 @@ static bool test_failure_lifecycle_is_policy_independent() {
     return true;
 }
 
+static bool test_arrival_policy_and_idle_clock() {
+    for (DispatchPolicy policy : {DispatchPolicy::FCFS, DispatchPolicy::SJF,
+                                  DispatchPolicy::PRIORITY}) {
+        PortDispatcher pd(1, 1, 1, policy);
+        pd.set_auto_dispatch(false);
+        pd.register_crane("C1");
+        pd.submit_job(make_job("LATE", 5, 6, 1));
+        pd.submit_job(make_job("EARLY", 0, 10, 3));
+        ASSERT_EQ(pd.simulation_time(), 0);
+        ASSERT_TRUE(pd.ordered_queue() == std::vector<std::string>({"EARLY"}));
+        ASSERT_TRUE(pd.flush_dispatch() == std::vector<std::string>({"EARLY"}));
+        ASSERT_EQ(pd.job_record("LATE").dispatch_seq, -1);
+        for (int t = 1; t <= 10; ++t) {
+            pd.step(true);
+            ASSERT_EQ(pd.simulation_time(), t);
+            ASSERT_TRUE(pd.job_state("EARLY") ==
+                (t == 10 ? JobState::COMPLETED : JobState::ACTIVE));
+        }
+        ASSERT_TRUE(pd.job_state("LATE") == JobState::ACTIVE);
+        ASSERT_EQ(pd.job_record("LATE").dispatch_seq, 1);
+        ASSERT_EQ(pd.job_record("LATE").work_completed, 0);
+        for (int t = 11; t <= 16; ++t) pd.step(true);
+        ASSERT_EQ(pd.simulation_time(), 16);
+        ASSERT_TRUE(pd.job_state("LATE") == JobState::COMPLETED);
+    }
+
+    PortDispatcher idle(1, 1, 1);
+    idle.register_crane("C1");
+    idle.submit_job(make_job("FUTURE", 5, 4));
+    ASSERT_TRUE(idle.job_state("FUTURE") == JobState::PENDING);
+    ASSERT_EQ(idle.job_record("FUTURE").dispatch_seq, -1);
+    for (int t = 1; t <= 5; ++t) {
+        StepResult step = idle.step();
+        ASSERT_EQ(idle.simulation_time(), t);
+        ASSERT_TRUE(step.advanced_job_ids.empty());
+    }
+    ASSERT_TRUE(idle.job_state("FUTURE") == JobState::ACTIVE);
+    ASSERT_EQ(idle.job_record("FUTURE").work_completed, 0);
+    return true;
+}
+
+static bool test_crane_registration_respects_capacity() {
+    PortDispatcher single(1, 1, 3);
+    single.register_crane("C1");
+    ASSERT_THROWS(single.register_crane("C1"));
+    ASSERT_THROWS(single.register_crane("C2"));
+    ASSERT_EQ(single.crane_registry().total_cranes(), 1);
+    ASSERT_EQ(single.resource_manager().total_capacity().cranes, 1);
+    ASSERT_EQ(single.resource_manager().available().cranes, 1);
+    single.submit_job(make_job("J1"));
+    ASSERT_TRUE(single.job_state("J1") == JobState::ACTIVE);
+
+    PortDispatcher multiple(2, 3, 3);
+    multiple.register_crane("C1");
+    multiple.register_crane("C2");
+    multiple.register_crane("C3");
+    ASSERT_THROWS(multiple.register_crane("C4"));
+    ASSERT_EQ(multiple.crane_registry().total_cranes(), 3);
+    ASSERT_EQ(multiple.resource_manager().total_capacity().cranes, 3);
+    ASSERT_EQ(multiple.resource_manager().available().cranes, 3);
+    return true;
+}
+
+static bool test_fcfs_arrival_order_and_concurrent_arrival() {
+    PortDispatcher fcfs(1, 1, 1);
+    fcfs.register_crane("C1");
+    fcfs.submit_job(make_job("LATE", 5, 6));
+    fcfs.submit_job(make_job("EARLY", 0, 10));
+    ASSERT_TRUE(fcfs.job_state("EARLY") == JobState::ACTIVE);
+    ASSERT_TRUE(fcfs.job_state("LATE") == JobState::PENDING);
+    ASSERT_EQ(fcfs.job_record("EARLY").dispatch_seq, 0);
+
+    PortDispatcher concurrent(2, 2, 2);
+    concurrent.register_crane("C1");
+    concurrent.register_crane("C2");
+    concurrent.submit_job(make_job("FIRST", 0, 10));
+    concurrent.submit_job(make_job("SECOND", 5, 2));
+    for (int t = 1; t <= 5; ++t) concurrent.step();
+    ASSERT_TRUE(concurrent.job_state("FIRST") == JobState::ACTIVE);
+    ASSERT_TRUE(concurrent.job_state("SECOND") == JobState::ACTIVE);
+    ASSERT_EQ(concurrent.job_record("FIRST").work_completed, 5);
+    ASSERT_EQ(concurrent.job_record("SECOND").work_completed, 0);
+    concurrent.step();
+    ASSERT_EQ(concurrent.simulation_time(), 6);
+    ASSERT_EQ(concurrent.job_record("FIRST").work_completed, 6);
+    ASSERT_EQ(concurrent.job_record("SECOND").work_completed, 1);
+    return true;
+}
+
 int main() {
     std::cout << "\n=== Port Dispatcher Integration Test Suite ===\n\n";
 
@@ -1774,6 +1863,9 @@ int main() {
     run_test("Step — failure/recovery preserves progress",      test_step_failure_recovery_preserves_progress);
     run_test("Step — undersupplied active job does not advance", test_step_skips_undersupplied_active_job);
     run_test("Failure lifecycle is consistent across policies", test_failure_lifecycle_is_policy_independent);
+    run_test("Arrival policy and idle clock", test_arrival_policy_and_idle_clock);
+    run_test("Crane registration respects capacity", test_crane_registration_respects_capacity);
+    run_test("FCFS arrival order and concurrent arrival", test_fcfs_arrival_order_and_concurrent_arrival);
 
     std::cout << "\n─── Summary ────────────────────────\n";
     std::cout << "  Total:  " << g_total  << "\n";

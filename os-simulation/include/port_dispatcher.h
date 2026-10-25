@@ -15,9 +15,9 @@
 // ─── Scheduling policy ────────────────────────────────────────────────────────
 // Determines queue ordering when selecting the next job to dispatch.
 //
-//   FCFS     – first-come first-served (submission_seq ordering)
-//   SJF      – shortest job first (work_remaining ascending; seq tiebreak)
-//   PRIORITY – lowest priority number first (seq tiebreak)
+//   FCFS     – earliest eligible arrival, then submission sequence
+//   SJF      – shortest eligible remaining work, then arrival and sequence
+//   PRIORITY – lowest eligible priority number, then arrival and sequence
 //
 // Policy is fixed at PortDispatcher construction and applied every time the
 // dispatcher selects the next job from the pending queue.
@@ -159,7 +159,8 @@ public:
 
     // Register a crane with the internal CraneRegistry.
     // Must be called before jobs requiring cranes can be dispatched.
-    // Throws std::invalid_argument on duplicate or empty crane_id.
+    // Throws std::invalid_argument on duplicate/empty crane_id or when the
+    // configured crane capacity has already been registered.
     void register_crane(const std::string& crane_id);
 
     // ── Batch-dispatch mode ────────────────────────────────────────────────────
@@ -265,10 +266,10 @@ public:
     //   • job is ACTIVE but has fewer active cranes than job.cranes requires
     void complete_job(const std::string& job_id);
 
-    // Advance every fully supplied ACTIVE job by exactly one simulated work
-    // unit. Jobs that become ACTIVE during this operation do not advance until
-    // the next call. In batch mode, continue_batch explicitly offers any newly
-    // available capacity to queued jobs after advancement/completion.
+    // Advance one shared simulation-time unit. Fully supplied jobs ACTIVE at
+    // the start do one work unit; arrivals at the new time may dispatch at the
+    // end, but do not work until the next step. Batch jobs dispatch only when
+    // continue_batch authorizes it.
     StepResult step(bool continue_batch = false);
 
     // Returns true iff a job has all of its required cranes currently ASSIGNED
@@ -294,9 +295,8 @@ public:
     // Throws std::invalid_argument if unknown.
     const JobRecord& job_record(const std::string& job_id) const;
 
-    // Job IDs in the exact order used by the live dispatch queue.  Includes
-    // both PENDING and INTERRUPTED jobs; INTERRUPTED precedence and all policy
-    // tie-breaks are applied by the same comparator used for dispatch.
+    // Currently eligible PENDING and INTERRUPTED job IDs in dispatch order.
+    // Future PENDING jobs remain stored but have no current queue position.
     std::vector<std::string> ordered_queue() const;
 
     // Number of jobs in PENDING or INTERRUPTED state (in the dispatch queue).
@@ -311,6 +311,7 @@ public:
     const DisruptionManager& disruption_manager()  const { return dm_; }
     DispatchPolicy           policy()              const { return policy_; }
     bool                     auto_dispatch()       const { return auto_dispatch_; }
+    int                      simulation_time()     const { return simulation_time_; }
 
 private:
     ResourceManager   rm_;
@@ -325,6 +326,7 @@ private:
 
     int next_seq_ = 0;  // monotonic submission counter
     int next_dispatch_seq_ = 0;  // monotonic first-dispatch counter
+    int simulation_time_ = 0;    // shared elapsed simulation time
 
     // All known job records, keyed by job_id.
     std::unordered_map<std::string, JobRecord> job_records_;

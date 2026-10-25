@@ -158,7 +158,15 @@ class SimulationExecution:
                         self._run_requested = False
                         self._recoverable_block = False
                         break
-                    if not result.get("advanced_jobs") and not result.get("dispatched_jobs"):
+                    simulation_time = snapshot.get("simulation_time")
+                    future_arrivals = isinstance(simulation_time, int | float) and any(
+                        job.get("state") == "PENDING"
+                        and isinstance(job.get("arrival_time"), int | float)
+                        and job["arrival_time"] > simulation_time
+                        for job in jobs
+                    )
+                    if (not result.get("advanced_jobs") and not result.get("dispatched_jobs")
+                            and not future_arrivals):
                         self.state = "blocked"
                         self.error = None
                         self._recoverable_block = True

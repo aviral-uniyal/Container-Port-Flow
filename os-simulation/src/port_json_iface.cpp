@@ -439,6 +439,7 @@ static void cmd_snapshot(const picojson::object& /*req*/) {
     picojson::object r;
     r["ok"] = picojson::value(true);
     r["batch_mode"] = picojson::value(!g_dp->auto_dispatch());
+    r["simulation_time"] = picojson::value(static_cast<double>(g_dp->simulation_time()));
     std::string pol_s = "FCFS";
     if (g_dp->policy() == DispatchPolicy::SJF) pol_s = "SJF";
     else if (g_dp->policy() == DispatchPolicy::PRIORITY) pol_s = "PRIORITY";

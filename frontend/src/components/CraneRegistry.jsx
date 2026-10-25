@@ -6,6 +6,7 @@ import { useState } from 'react'
  *
  * Props:
  *   cranes         — array of crane objects: { crane_id, status, assigned_job_id? }
+ *   capacity       — configured maximum number of registered cranes
  *   onRegister     — callback(crane_id) to register a new crane
  *   onFail         — callback(crane_id) to mark a crane as failed
  *   onRecover      — callback(crane_id) to recover a failed crane
@@ -15,6 +16,7 @@ import { useState } from 'react'
  */
 export default function CraneRegistry({
   cranes = [],
+  capacity,
   inventory,
   onRegister,
   onFail,
@@ -25,7 +27,8 @@ export default function CraneRegistry({
 }) {
   const [craneId, setCraneId] = useState('')
   const registeredIds = new Set(cranes.map(crane => crane.crane_id))
-  const eligible = (inventory?.cranes ?? []).filter(
+  const atCapacity = Number.isInteger(capacity) && cranes.length >= capacity
+  const eligible = (atCapacity ? [] : inventory?.cranes ?? []).filter(
     crane => /^C(?:[1-9]|1[0-2])$/.test(crane.crane_id) &&
       crane.status === 'AVAILABLE' && !registeredIds.has(crane.crane_id)
   )
@@ -39,7 +42,7 @@ export default function CraneRegistry({
 
   function handleSubmit(e) {
     e.preventDefault()
-    if (selectedCraneId && onRegister) {
+    if (!atCapacity && selectedCraneId && onRegister) {
       onRegister(selectedCraneId)
       setCraneId('')
     }
@@ -81,7 +84,11 @@ export default function CraneRegistry({
               {disabled ? 'Registering…' : 'Register Crane'}
             </button>
           </form>
-          {eligible.length === 0 && (
+          {atCapacity ? (
+            <p style={{ color: 'var(--clr-text-muted)', fontSize: 'var(--text-sm)' }}>
+              Crane registration limit reached ({cranes.length}/{capacity}).
+            </p>
+          ) : eligible.length === 0 && (
             <p style={{ color: 'var(--clr-text-muted)', fontSize: 'var(--text-sm)' }}>
               No eligible database cranes are available to register.
             </p>
