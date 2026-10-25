@@ -224,9 +224,17 @@ test('connection bar excludes operational messages', () => {
   assert.doesNotMatch(html, /Job submitted/)
 })
 
-test('dashboard sections follow the Stage 5 order', () => {
+test('Dashboard is the default tab and inventory stays mounted in its hidden view', async () => {
   const html = renderToStaticMarkup(React.createElement(App))
+  assert.match(html, /aria-label="Main views"/)
+  assert.match(html, /aria-current="page" aria-controls="dashboard-view"/)
+  assert.match(html, /aria-controls="inventory-view"/)
+  assert.match(html, /id="dashboard-view" class="app-main__view">/)
+  assert.match(html, /id="inventory-view" class="app-main__view" hidden=""/)
+  const dashboard = html.split('id="dashboard-view"')[1].split('id="inventory-view"')[0]
+  const inventory = html.split('id="inventory-view"')[1]
   const labels = [
+    'Connection status',
     'Resource Summary',
     'Operational feedback',
     'Simulation Setup',
@@ -234,10 +242,18 @@ test('dashboard sections follow the Stage 5 order', () => {
     'Simulation Execution',
     'Simulation Jobs',
     'Crane Registry',
-    'Database Inventory',
   ]
-  const positions = labels.map(label => html.indexOf(label))
+  const positions = labels.map(label => dashboard.indexOf(label))
   assert.ok(positions.every(position => position >= 0))
   assert.deepEqual([...positions].sort((a, b) => a - b), positions)
-  assert.match(html, /NOT RUNNING/)
+  assert.doesNotMatch(dashboard, /Database Inventory/)
+  assert.match(inventory, /Database Inventory/)
+  assert.match(dashboard, /NOT RUNNING/)
+  const source = await readFile(new URL('../src/App.jsx', import.meta.url), 'utf8')
+  assert.match(source, /onClick=\{\(\) => setActiveTab\('inventory'\)\}/)
+  assert.match(source, /onClick=\{\(\) => setActiveTab\('dashboard'\)\}/)
+  assert.match(source, /hidden=\{activeTab !== 'dashboard'\}/)
+  assert.match(source, /hidden=\{activeTab !== 'inventory'\}/)
+  assert.ok(html.indexOf('btn-refresh-snapshot') < html.indexOf('id="dashboard-view"'))
+  assert.ok(html.indexOf('btn-reset-simulation') < html.indexOf('id="dashboard-view"'))
 })

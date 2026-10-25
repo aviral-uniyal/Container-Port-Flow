@@ -57,6 +57,7 @@ export default function App() {
   const [inventoryLoading, setInventoryLoading] = useState(false)
   const [inventoryError,   setInventoryError]   = useState(null)
   const [lastFailResult,   setLastFailResult]   = useState(null)
+  const [activeTab,        setActiveTab]        = useState('dashboard')
   // batchMode mirrors the C++ dispatcher's batch_mode flag set during init.
   // When true the dashboard shows the "Dispatch All" button.
   const [batchMode,        setBatchMode]        = useState(false)
@@ -520,8 +521,15 @@ export default function App() {
       {/* ── Header ──────────────────────────────────────────── */}
       <header className="app-header" role="banner">
         <h1 className="app-header__logo">Container-Port-Flow</h1>
-        <span className="app-header__subtitle">Port Operations Dashboard</span>
-        <div style={{ marginLeft: 'auto', display: 'flex', gap: 'var(--space-2)' }}>
+        <nav className="app-header__nav" aria-label="Main views">
+          <button type="button" className={`app-header__tab${activeTab === 'dashboard' ? ' app-header__tab--active' : ''}`}
+            aria-current={activeTab === 'dashboard' ? 'page' : undefined} aria-controls="dashboard-view"
+            onClick={() => setActiveTab('dashboard')}>Dashboard</button>
+          <button type="button" className={`app-header__tab${activeTab === 'inventory' ? ' app-header__tab--active' : ''}`}
+            aria-current={activeTab === 'inventory' ? 'page' : undefined} aria-controls="inventory-view"
+            onClick={() => setActiveTab('inventory')}>Inventory</button>
+        </nav>
+        <div className="app-header__actions">
           <button
             id="btn-refresh-snapshot"
             className="btn btn--outline btn--sm"
@@ -543,6 +551,7 @@ export default function App() {
 
       {/* ── Main ────────────────────────────────────────────── */}
       <main className="app-main" role="main">
+        <div id="dashboard-view" className="app-main__view" hidden={activeTab !== 'dashboard'}>
 
         {/* Status Bar */}
         <StatusBar
@@ -635,13 +644,16 @@ export default function App() {
           loading={loading}
           lastFailResult={lastFailResult}
         />
+        </div>
 
-        {/* Database Inventory — PostgreSQL physical resources */}
-        <DatabaseInventory
-          inventory={inventory}
-          loading={inventoryLoading}
-          error={inventoryError}
-        />
+        <div id="inventory-view" className="app-main__view" hidden={activeTab !== 'inventory'}>
+          {/* Database Inventory — PostgreSQL physical resources */}
+          <DatabaseInventory
+            inventory={inventory}
+            loading={inventoryLoading}
+            error={inventoryError}
+          />
+        </div>
 
       </main>
     </>

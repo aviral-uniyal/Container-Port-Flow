@@ -160,6 +160,30 @@ test('inventory renders total count and all three backend ship status labels', (
   assert.match(html, /id="db-ships-search"/)
 })
 
+test('database inventory retains all four detailed record lists', () => {
+  const inventory = {
+    terminals: [{ terminal_id: 1, terminal_name: 'Terminal One', description: 'Main terminal' }],
+    berths: [{ berth_id: 1, berth_name: 'Berth One', terminal_id: 1 }],
+    cranes: Array.from({ length: 12 }, (_, i) => ({
+      crane_id: `C${i + 1}`, terminal_id: 1, status: 'AVAILABLE', updated_at: null,
+    })),
+    ships: Array.from({ length: 179 }, (_, i) => ({
+      ship_id: i + 1, vessel_name: `Ship ${i + 1}`, status: 'NOT ARRIVED',
+    })),
+  }
+  const html = renderToStaticMarkup(React.createElement(DatabaseInventory, { inventory }))
+  for (const label of ['Terminal records', 'Berth records', 'Crane records from database', 'Ships from PostgreSQL']) {
+    assert.ok(html.includes(label))
+  }
+  assert.match(html, /Terminal One/)
+  assert.match(html, /Berth One/)
+  for (let i = 1; i <= 12; i += 1) {
+    assert.ok(html.includes(`C${i}</code>`))
+  }
+  assert.match(html, /Ships <span>\(179 total\)<\/span>/)
+  assert.equal((html.match(/class="ships-inventory__row"/g) ?? []).length, 179)
+})
+
 test('fresh inventory responses replace prior statuses after completion and refresh', () => {
   const render = currentShips => renderToStaticMarkup(React.createElement(DatabaseInventory, {
     inventory: { terminals: [], berths: [], cranes: [], ships: currentShips },
