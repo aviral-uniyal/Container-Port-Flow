@@ -17,7 +17,7 @@ import pytest
 from backend.app.cpp_bridge import CppBridge
 from backend.app.execution import SimulationExecution
 from backend.app.main import app as main_app
-from backend.app.router import router
+from backend.app.router import router, simulation_dispatch, simulation_reconcile, simulation_run
 
 
 class WorkBridge:
@@ -455,6 +455,91 @@ def test_reset_preserves_completed_history_and_refuses_unavailable_database():
             release.assert_called_once_with(conn, 9, "SIMULATION_RESET")
             close_run.assert_called_once_with(conn, 9, "COMPLETED")
             assert client.app.state.current_run_id is None
+
+
+def test_dispatch_waits_for_runner_snapshot_persistence():
+    async def scenario():
+        bridge = WorkBridge(batch=True, work=(20,))
+        execution = SimulationExecution(bridge)
+        state = SimpleNamespace(bridge=bridge, execution=execution, current_run_id=7,
+                                db_pool=SimpleNamespace(is_open=True))
+        request = SimpleNamespace(app=SimpleNamespace(state=state))
+        persisting = threading.Event()
+        release = threading.Event()
+        persisted = []
+
+        def persist(_request, snapshot):
+            persisted.append(snapshot["jobs"][0]["work_completed"])
+            if len(persisted) == 1:
+                persisting.set()
+                assert release.wait(2)
+            return {"reconciled_cranes": 1, "reconciled_jobs": 1}
+
+        with patch("backend.app.router._persist_snapshot", side_effect=persist):
+            await simulation_run(request)
+            try:
+                assert await asyncio.to_thread(persisting.wait, 2)
+                dispatch = asyncio.create_task(simulation_dispatch(request))
+                await asyncio.sleep(0.05)
+                assert not dispatch.done()
+                assert not any(c["cmd"] == "dispatch_batch" for c in bridge.commands)
+                release.set()
+                assert (await asyncio.wait_for(dispatch, 2))["ok"] is True
+                assert [c["cmd"] for c in bridge.commands[:4]] == [
+                    "step", "snapshot", "dispatch_batch", "snapshot",
+                ]
+                assert persisted == [0, 0]
+            finally:
+                release.set()
+                await execution.pause()
+
+    asyncio.run(scenario())
+
+
+def test_reconcile_waits_for_complete_runner_step_before_snapshot():
+    async def scenario():
+        bridge = WorkBridge(work=(20,))
+        original_send = bridge.send
+        stepping = threading.Event()
+        release = threading.Event()
+        persisted = []
+
+        def gated_send(command):
+            result = original_send(command)
+            if command["cmd"] == "step":
+                stepping.set()
+                assert release.wait(2)
+            return result
+
+        bridge.send = gated_send
+        execution = SimulationExecution(bridge)
+        state = SimpleNamespace(bridge=bridge, execution=execution, current_run_id=7,
+                                db_pool=SimpleNamespace(is_open=True))
+        request = SimpleNamespace(app=SimpleNamespace(state=state))
+
+        def persist(_request, snapshot):
+            persisted.append(snapshot["jobs"][0]["work_completed"])
+            return {"reconciled_cranes": 1, "reconciled_jobs": 1}
+
+        with patch("backend.app.router._persist_snapshot", side_effect=persist):
+            await simulation_run(request)
+            try:
+                assert await asyncio.to_thread(stepping.wait, 2)
+                reconcile = asyncio.create_task(simulation_reconcile(request))
+                await asyncio.sleep(0.05)
+                assert not reconcile.done()
+                assert [c["cmd"] for c in bridge.commands] == ["step"]
+                release.set()
+                assert (await asyncio.wait_for(reconcile, 2))["ok"] is True
+                assert [c["cmd"] for c in bridge.commands[:3]] == [
+                    "step", "snapshot", "snapshot",
+                ]
+                assert persisted == [1, 1]
+            finally:
+                release.set()
+                await execution.pause()
+
+    asyncio.run(scenario())
 
 
 def test_actual_cpp_bridge_step_and_run():
