@@ -10,6 +10,7 @@
 //
 // Commands (field "cmd"):
 //   "init"              – create PortDispatcher with capacities and policy
+//   "reset"             – discard the current dispatcher
 //   "register_crane"    – add a crane to the registry
 //   "submit_job"        – enqueue a vessel job
 //   "complete_job"      – mark an ACTIVE job done
@@ -194,6 +195,15 @@ static void cmd_init(const picojson::object& req) {
     } catch (const std::exception& ex) {
         emit_error(ex.what());
     }
+}
+
+// "reset": discard the current dispatcher; a later init starts a fresh run.
+static void cmd_reset(const picojson::object& /*req*/) {
+    g_dp.reset();
+    g_known_jobs.clear();
+    picojson::object r;
+    r["ok"] = picojson::value(true);
+    emit(r);
 }
 
 // "register_crane": {"cmd":"register_crane","crane_id":"C1"}
@@ -434,7 +444,15 @@ static void cmd_step(const picojson::object& req) {
 
 // "snapshot": {"cmd":"snapshot"}
 static void cmd_snapshot(const picojson::object& /*req*/) {
-    if (!g_dp) { emit_error("dispatcher not initialised"); return; }
+    if (!g_dp) {
+        picojson::object r;
+        r["ok"] = picojson::value(true);
+        r["initialized"] = picojson::value(false);
+        r["jobs"] = picojson::value(picojson::array());
+        r["cranes"] = picojson::value(picojson::array());
+        emit(r);
+        return;
+    }
 
     picojson::object r;
     r["ok"] = picojson::value(true);
@@ -579,6 +597,7 @@ int main() {
         }
 
         if      (cmd == "init")              cmd_init(req);
+        else if (cmd == "reset")             cmd_reset(req);
         else if (cmd == "register_crane")    cmd_register_crane(req);
         else if (cmd == "submit_job")        cmd_submit_job(req);
         else if (cmd == "complete_job")      cmd_complete_job(req);

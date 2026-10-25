@@ -34,6 +34,7 @@ class WorkBridge:
             for i, total in enumerate(work)
         ]
         self.crane_failed = False
+        self.registered = True
         self.commands: list[dict] = []
         self.fail_step = False
 
@@ -43,17 +44,30 @@ class WorkBridge:
             cmd = command["cmd"]
             if cmd == "init":
                 self.jobs.clear()
+                self.registered = True
                 self.batch = command.get("batch_mode", False)
                 return {"ok": True, "policy": command.get("policy", "FCFS"),
                         "batch_mode": self.batch}
+            if cmd == "reset":
+                self.jobs.clear()
+                self.registered = False
+                return {"ok": True}
+            if cmd == "submit_job":
+                total = command["work_total"]
+                self.jobs.append({
+                    "job_id": command["job_id"], "state": "ACTIVE",
+                    "work_total": total, "work_completed": 0, "work_remaining": total,
+                })
+                return {"ok": True, "job_id": command["job_id"]}
             if cmd == "snapshot":
                 assigned = next((j["job_id"] for j in self.jobs if j["state"] == "ACTIVE"), "")
                 return {"ok": True, "batch_mode": self.batch,
                         "jobs": [j.copy() for j in self.jobs],
-                        "cranes": [{"crane_id": "C1",
+                        "cranes": ([{"crane_id": "C1",
                                     "status": "FAILED" if self.crane_failed else
                                     "ASSIGNED" if assigned else "AVAILABLE",
-                                    "assigned_job": "" if self.crane_failed else assigned}]}
+                                    "assigned_job": "" if self.crane_failed else assigned}]
+                                   if self.registered else [])}
             if cmd == "step":
                 if self.fail_step:
                     return {"ok": False, "error": "step rejected"}
@@ -356,6 +370,91 @@ def test_reset_waits_for_active_runner_before_database_reconciliation():
             cancel.assert_called_once_with(connection.return_value.__enter__.return_value, 7)
             assert bridge.jobs == []
             assert client.app.state.current_run_id == 8
+
+
+def test_completed_workload_keeps_run_open_for_another_submission():
+    bridge = WorkBridge(work=(1, 1))
+    with client_for(bridge) as client:
+        client.app.state.db_pool = SimpleNamespace(is_open=True)
+        client.app.state.current_run_id = 7
+        with patch("backend.app.router._persist_snapshot"), \
+             patch("backend.app.router.close_simulation_run") as close_run, \
+             patch("backend.app.router.get_connection"), \
+             patch("backend.app.router.ship_exists", return_value=True), \
+             patch("backend.app.router.ship_has_job_in_run", return_value=False), \
+             patch("backend.app.router.insert_simulation_job"), \
+             patch("backend.app.router._sync_crane_statuses"):
+            assert client.post("/simulation/run", json={"interval_seconds": 0.05}).status_code == 200
+            wait_for(client, "completed")
+            assert client.app.state.current_run_id == 7
+            close_run.assert_not_called()
+            response = client.post("/simulation/jobs", json={
+                "ship_id": 1, "job_id": "LATER", "arrival_time": 0,
+                "work_total": 1, "priority": 1, "berths": 1,
+                "cranes": 1, "trucks": 0,
+            })
+            assert response.status_code == 200
+            assert client.post("/simulation/run", json={"interval_seconds": 0.05}).status_code == 200
+            wait_for(client, "completed")
+            assert bridge.jobs[-1]["state"] == "COMPLETED"
+            assert client.app.state.current_run_id == 7
+            close_run.assert_not_called()
+
+
+def test_dashboard_reset_stops_runner_and_closes_only_current_run():
+    bridge = WorkBridge(work=(20,))
+    with client_for(bridge) as client:
+        client.app.state.db_pool = SimpleNamespace(is_open=True)
+        client.app.state.current_run_id = 7
+        with patch("backend.app.router._persist_snapshot"), \
+             patch("backend.app.router.get_connection") as connection, \
+             patch("backend.app.router.get_active_assignments_for_run", return_value=[]), \
+             patch("backend.app.router.cancel_unfinished_jobs_for_run") as cancel, \
+             patch("backend.app.router.release_active_assignments_for_run") as release, \
+             patch("backend.app.router.batch_sync_crane_statuses",
+                   side_effect=lambda conn, statuses: len(statuses)), \
+             patch("backend.app.router.close_simulation_run") as close_run, \
+             patch("backend.app.router.insert_simulation_run", return_value=8) as insert_run:
+            assert client.post("/simulation/run", json={"interval_seconds": 0.05}).status_code == 200
+            wait_for_work(bridge)
+            assert client.post("/simulation/reset").status_code == 200
+            conn = connection.return_value.__enter__.return_value
+            cancel.assert_called_once_with(conn, 7)
+            release.assert_called_once_with(conn, 7, "SIMULATION_RESET")
+            close_run.assert_called_once_with(conn, 7, "FAILED")
+            insert_run.assert_not_called()
+            assert bridge.jobs == []
+            assert client.get("/simulation/snapshot").json()["cranes"] == []
+            assert client.app.state.current_run_id is None
+            assert client.get("/simulation/execution").json()["state"] == "not_running"
+            assert client.post("/simulation/init", json={
+                "berths": 1, "cranes": 1, "trucks": 0,
+            }).status_code == 200
+
+
+def test_reset_preserves_completed_history_and_refuses_unavailable_database():
+    bridge = WorkBridge(work=(1,))
+    with client_for(bridge) as client:
+        client.app.state.current_run_id = 9
+        assert client.post("/simulation/reset").status_code == 503
+        assert bridge.jobs[0]["state"] == "ACTIVE"
+        assert not any(command["cmd"] == "reset" for command in bridge.commands)
+
+        bridge.jobs[0]["state"] = "COMPLETED"
+        client.app.state.db_pool = SimpleNamespace(is_open=True)
+        with patch("backend.app.router.get_connection") as connection, \
+             patch("backend.app.router.get_active_assignments_for_run", return_value=[]), \
+             patch("backend.app.router.cancel_unfinished_jobs_for_run") as cancel, \
+             patch("backend.app.router.release_active_assignments_for_run") as release, \
+             patch("backend.app.router.batch_sync_crane_statuses",
+                   side_effect=lambda conn, statuses: len(statuses)), \
+             patch("backend.app.router.close_simulation_run") as close_run:
+            assert client.post("/simulation/reset").status_code == 200
+            conn = connection.return_value.__enter__.return_value
+            cancel.assert_called_once_with(conn, 9)
+            release.assert_called_once_with(conn, 9, "SIMULATION_RESET")
+            close_run.assert_called_once_with(conn, 9, "COMPLETED")
+            assert client.app.state.current_run_id is None
 
 
 def test_actual_cpp_bridge_step_and_run():

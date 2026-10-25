@@ -4,7 +4,7 @@ import { after, before, test } from 'node:test'
 import React from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { createServer } from 'vite'
-import { dispatchBatch } from '../src/api.js'
+import { dispatchBatch, resetSimulation } from '../src/api.js'
 
 let server
 let App
@@ -186,6 +186,30 @@ test('blocked execution distinguishes resource waits from backend failures', () 
 test('execution status displays the idle backend state as NOT RUNNING', () => {
   assert.equal(executionStatusLabel('not_running'), 'NOT RUNNING')
   assert.equal(executionStatusLabel('paused'), 'PAUSED')
+})
+
+test('Reset is beside Refresh and confirmation guards the API request', async () => {
+  const html = renderToStaticMarkup(React.createElement(App))
+  assert.ok(html.indexOf('btn-refresh-snapshot') < html.indexOf('btn-reset-simulation'))
+  assert.match(html, /id="btn-reset-simulation"[^>]*disabled=""/)
+  const source = await readFile(new URL('../src/App.jsx', import.meta.url), 'utf8')
+  const handler = source.split('async function handleReset() {')[1].split('\n  return (')[0]
+  assert.match(handler, /if \(!window\.confirm\([\s\S]*?\)\) return[\s\S]*?resetSimulation\(\)/)
+})
+
+test('Reset API calls the dedicated endpoint', async () => {
+  const originalFetch = globalThis.fetch
+  let request
+  globalThis.fetch = async (url, options) => {
+    request = { url, options }
+    return { ok: true, json: async () => ({ ok: true }) }
+  }
+  try {
+    assert.equal((await resetSimulation()).ok, true)
+    assert.deepEqual(request, { url: '/simulation/reset', options: { method: 'POST' } })
+  } finally {
+    globalThis.fetch = originalFetch
+  }
 })
 
 test('connection bar excludes operational messages', () => {

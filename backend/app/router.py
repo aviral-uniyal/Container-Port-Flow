@@ -275,6 +275,24 @@ def health(request: Request):
     }
 
 
+def _close_previous_run(conn, run_id: int, snapshot: dict[str, Any]) -> None:
+    """Retire only the active run's allocations and close its history."""
+    assignments = get_active_assignments_for_run(conn, run_id)
+    reset_ids = {c["crane_id"] for c in snapshot["cranes"]}
+    reset_ids.update(a["crane_id"] for a in assignments)
+    cancel_unfinished_jobs_for_run(conn, run_id)
+    release_active_assignments_for_run(conn, run_id, "SIMULATION_RESET")
+    reset_statuses = [{"crane_id": cid, "status": "AVAILABLE"}
+                      for cid in sorted(reset_ids)]
+    if (reset_statuses and
+            batch_sync_crane_statuses(conn, reset_statuses) != len(reset_statuses)):
+        raise RuntimeError("A previous runtime crane is missing from inventory")
+    terminal = ("COMPLETED" if snapshot["jobs"] and all(
+        job["state"] in ("COMPLETED", "CANCELLED")
+        for job in snapshot["jobs"]) else "FAILED")
+    close_simulation_run(conn, run_id, terminal)
+
+
 @router.post("/simulation/init")
 async def simulation_init(body: InitRequest, request: Request):
     """Close the prior run before replacing its in-memory dispatcher."""
@@ -310,20 +328,7 @@ async def simulation_init(body: InitRequest, request: Request):
         # therefore leaves the previous runtime intact.
         with get_connection(pool) as conn:
             if previous_run_id is not None:
-                assignments = get_active_assignments_for_run(conn, previous_run_id)
-                reset_ids = {c["crane_id"] for c in snapshot["cranes"]}
-                reset_ids.update(a["crane_id"] for a in assignments)
-                cancel_unfinished_jobs_for_run(conn, previous_run_id)
-                release_active_assignments_for_run(conn, previous_run_id, "SIMULATION_RESET")
-                reset_statuses = [{"crane_id": cid, "status": "AVAILABLE"}
-                                  for cid in sorted(reset_ids)]
-                if (reset_statuses and
-                        batch_sync_crane_statuses(conn, reset_statuses) != len(reset_statuses)):
-                    raise RuntimeError("A previous runtime crane is missing from inventory")
-                terminal = ("COMPLETED" if snapshot["jobs"] and all(
-                    job["state"] in ("COMPLETED", "CANCELLED")
-                    for job in snapshot["jobs"]) else "FAILED")
-                close_simulation_run(conn, previous_run_id, terminal)
+                _close_previous_run(conn, previous_run_id, snapshot)
             candidate_run_id = insert_simulation_run(
                 conn, run_name=run_name,
                 scheduling_policy=body.policy.value if body.policy else "FCFS",
@@ -358,8 +363,53 @@ async def simulation_init(body: InitRequest, request: Request):
     request.app.state.current_run_id = new_run_id
     return resp
 
+
+@router.post("/simulation/reset")
+async def simulation_reset(request: Request):
+    """Stop execution, close the current run, and clear the C++ dispatcher."""
+    execution = _get_execution(request)
+    pool = _get_db_pool(request)
+    if getattr(request.app.state, "current_run_id", None) is not None and pool is None:
+        raise HTTPException(status_code=503, detail="Database unavailable; active simulation was not reset")
+    closed_run = False
+
+    def prepare_reset(snapshot):
+        nonlocal closed_run
+        run_id = getattr(request.app.state, "current_run_id", None)
+        if run_id is None:
+            return
+        if pool is None or snapshot is None:
+            raise RuntimeError("Previous simulation snapshot or database is unavailable")
+        with get_connection(pool) as conn:
+            _close_previous_run(conn, run_id, snapshot)
+        closed_run = True
+
+    try:
+        response = await execution.reset(
+            {"cmd": "reset"}, before_reset=prepare_reset,
+            capture_snapshot=lambda: getattr(request.app.state, "current_run_id", None) is not None,
+        )
+    except Exception as exc:
+        # A failed DB prepare leaves the dispatcher intact. A bridge failure
+        # after DB closure requires restart, as with failed re-initialization.
+        if closed_run:
+            # The closure might have committed; prevent further writes to it.
+            request.app.state.bridge = None
+            request.app.state.current_run_id = None
+        logger.exception("Simulation reset failed")
+        raise HTTPException(status_code=503, detail="Simulation reset failed; restart the backend if the run was closed") from exc
+    request.app.state.current_run_id = None
+    execution.on_snapshot = None
+    return response
+
 @router.post("/simulation/cranes")
-def simulation_register_crane(body: CraneRegisterRequest, request: Request):
+async def simulation_register_crane(body: CraneRegisterRequest, request: Request):
+    execution = _get_execution(request)
+    async with execution.lock:
+        return await asyncio.to_thread(_simulation_register_crane_sync, body, request)
+
+
+def _simulation_register_crane_sync(body: CraneRegisterRequest, request: Request):
     """Register only an existing AVAILABLE physical crane."""
     bridge = _get_bridge(request)
     crane_id = body.crane_id.strip()
@@ -545,7 +595,13 @@ async def simulation_pause(request: Request):
 
 
 @router.post("/simulation/dispatch")
-def simulation_dispatch(request: Request):
+async def simulation_dispatch(request: Request):
+    execution = _get_execution(request)
+    async with execution.lock:
+        return await asyncio.to_thread(_simulation_dispatch_sync, request)
+
+
+def _simulation_dispatch_sync(request: Request):
     """Trigger batch dispatch of queued jobs according to the active policy."""
     bridge = _get_bridge(request)
     resp = _send(bridge, {"cmd": "dispatch_batch"})
@@ -849,7 +905,13 @@ def _simulation_crane_recover_sync(crane_id: str, request: Request):
 
 
 @router.post("/simulation/reconcile")
-def simulation_reconcile(request: Request):
+async def simulation_reconcile(request: Request):
+    execution = _get_execution(request)
+    async with execution.lock:
+        return await asyncio.to_thread(_simulation_reconcile_sync, request)
+
+
+def _simulation_reconcile_sync(request: Request):
     """Repair job, crane and assignment rows from the current C++ snapshot."""
     bridge = _get_bridge(request)
     if _get_db_pool(request) is None:

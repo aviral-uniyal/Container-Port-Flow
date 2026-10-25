@@ -72,6 +72,16 @@ export async function initSimulation(payload) {
   }
 }
 
+/** POST /simulation/reset — stop and clear the current simulation. */
+export async function resetSimulation() {
+  try {
+    const res = await fetch('/simulation/reset', { method: 'POST' })
+    return handleResponse(res)
+  } catch {
+    return { ok: false, error: 'API unreachable' }
+  }
+}
+
 /**
  * POST /simulation/cranes
  */

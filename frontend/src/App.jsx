@@ -19,6 +19,7 @@ import {
   fetchHealth,
   fetchInventory,
   initSimulation,
+  resetSimulation,
   submitJob,
   completeJob,
   fetchSnapshot,
@@ -80,6 +81,13 @@ export default function App() {
 
   /* ── Apply a snapshot response to state ── */
   const applySnapshot = useCallback((data) => {
+    if (data.initialized === false) {
+      setResources(null)
+      setJobs([])
+      setCranes([])
+      setBatchMode(false)
+      return
+    }
     const res = data.resources
     if (res) {
       setResources({
@@ -479,6 +487,34 @@ export default function App() {
     }
   }
 
+  async function handleReset() {
+    if (!window.confirm('Stop the current simulation and clear its active jobs and registered cranes? Historical records will be kept.')) return
+    setBusy('reset', true)
+    const result = await resetSimulation()
+    if (!result.ok) {
+      setBusy('reset', false)
+      setFeedback({ message: `Reset failed: ${result.error}`, severity: 'err' })
+      return
+    }
+    snapshotRequestRef.current += 1
+    executionRequestRef.current += 1
+    jobOrderRef.current = []
+    craneOrderRef.current = []
+    jobMetadataRef.current = new Map()
+    policyRef.current = 'FCFS'
+    executionStateRef.current = 'not_running'
+    runRequestRef.current = false
+    setResources(null)
+    setJobs([])
+    setCranes([])
+    setBatchMode(false)
+    setLastFailResult(null)
+    setExecution({ state: 'not_running', interval_seconds: 1, error: null })
+    await Promise.all([refreshSnapshot(), refreshExecution(), refreshInventory()])
+    setBusy('reset', false)
+    setFeedback({ message: 'Simulation reset. You can initialize a new simulation.', severity: 'ok' })
+  }
+
   return (
     <>
       {/* ── Header ──────────────────────────────────────────── */}
@@ -490,9 +526,17 @@ export default function App() {
             id="btn-refresh-snapshot"
             className="btn btn--outline btn--sm"
             onClick={handleRefresh}
-            disabled={loading.refresh}
+            disabled={loading.refresh || loading.reset}
           >
             {loading.refresh ? 'Refreshing…' : '↻ Refresh'}
+          </button>
+          <button
+            id="btn-reset-simulation"
+            className="btn btn--outline btn--sm"
+            onClick={handleReset}
+            disabled={loading.reset || loading.init || resources === null}
+          >
+            {loading.reset ? 'Resetting…' : 'Reset'}
           </button>
         </div>
       </header>
@@ -519,10 +563,10 @@ export default function App() {
         </section>
 
         <div className="app-main__two-col">
-          <SimulationSetup onSubmit={handleInit} disabled={loading.init} />
+          <SimulationSetup onSubmit={handleInit} disabled={loading.init || loading.reset} />
           <JobForm
             onSubmit={handleJobSubmit}
-            disabled={loading.job}
+            disabled={loading.job || loading.reset}
             ships={inventory?.ships}
             inventoryLoading={inventoryLoading}
             inventoryError={inventoryError}
@@ -543,7 +587,7 @@ export default function App() {
                 id="btn-run-simulation"
                 className="btn btn--primary"
                 onClick={handleRun}
-                disabled={execution.state === 'running' || loading.run || loading.pause || loading.step}
+                disabled={execution.state === 'running' || loading.run || loading.pause || loading.step || loading.reset || resources === null}
               >
                 {loading.run ? 'Starting…' : '▶ Run'}
               </button>
@@ -551,7 +595,7 @@ export default function App() {
                 id="btn-pause-simulation"
                 className="btn btn--outline"
                 onClick={handlePause}
-                disabled={execution.state !== 'running' || loading.pause}
+                disabled={execution.state !== 'running' || loading.pause || loading.reset}
               >
                 {loading.pause ? 'Pausing…' : 'Ⅱ Pause'}
               </button>
@@ -559,7 +603,7 @@ export default function App() {
                 id="btn-step-simulation"
                 className="btn btn--outline"
                 onClick={handleStep}
-                disabled={execution.state === 'running' || loading.step || loading.run || loading.pause}
+                disabled={execution.state === 'running' || loading.step || loading.run || loading.pause || loading.reset || resources === null}
               >
                 {loading.step ? 'Stepping…' : 'Step +1'}
               </button>
@@ -587,7 +631,7 @@ export default function App() {
           onRegister={handleCraneRegister}
           onFail={handleCraneFail}
           onRecover={handleCraneRecover}
-          disabled={loading.crane}
+          disabled={loading.crane || loading.reset}
           loading={loading}
           lastFailResult={lastFailResult}
         />

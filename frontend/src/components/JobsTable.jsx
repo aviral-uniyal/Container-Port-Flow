@@ -52,7 +52,7 @@ export default function JobsTable({ jobs = [], onComplete, onDispatch, batchMode
               type="button"
               className="btn btn--primary btn--sm"
               onClick={onDispatch}
-              disabled={loading.dispatch}
+              disabled={loading.dispatch || loading.reset}
               title="Dispatch all queued jobs using the active scheduling policy"
             >
               {loading.dispatch ? 'Dispatching…' : '▶▶ Dispatch All'}
@@ -136,7 +136,7 @@ export default function JobsTable({ jobs = [], onComplete, onDispatch, batchMode
                             id={`btn-complete-job-${job.job_id}`}
                             className="btn btn--outline btn--sm"
                             onClick={() => onComplete?.(job.job_id)}
-                            disabled={loading[`complete-${job.job_id}`] || !isEligible}
+                            disabled={loading[`complete-${job.job_id}`] || loading.reset || !isEligible}
                             title={!isEligible ? 'Cannot complete: missing required crane(s). Recover cranes before completing.' : 'Mark job completed'}
                           >
                             {loading[`complete-${job.job_id}`] ? 'Completing…' : 'Complete'}

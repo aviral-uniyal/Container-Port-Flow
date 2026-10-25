@@ -148,7 +148,7 @@ export default function CraneRegistry({
                 const recoverKey = `recover-${crane.crane_id}`
                 const isFailing = loading[failKey]
                 const isRecovering = loading[recoverKey]
-                const isBusy = isFailing || isRecovering
+                const isBusy = isFailing || isRecovering || loading.reset
 
                 return (
                   <tr key={crane.crane_id}>
