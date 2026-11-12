@@ -26,6 +26,8 @@ PG_BIN = Path(r"C:\Program Files\PostgreSQL\18\bin")
 PG_SERVICE = "postgresql-x64-18"
 PLACEHOLDER = "YOUR_ACTUAL_POSTGRESQL_PASSWORD"
 DB_KEYS = ("PGHOST", "PGPORT", "PGDATABASE", "PGUSER", "PGPASSWORD")
+OPTIONAL_ENV_KEYS = ("CPP_EXE_PATH",)
+ALL_ENV_KEYS = DB_KEYS + OPTIONAL_ENV_KEYS
 BACKEND_URL = "http://127.0.0.1:8000"
 FRONTEND_URL = "http://127.0.0.1:5173"
 
@@ -47,16 +49,18 @@ def load_config(path: Path = CONFIG_FILE) -> dict[str, str]:
             continue
         key, separator, value = line.partition("=")
         key = key.strip()
-        if not separator or key not in DB_KEYS or key in values:
-            raise SetupError(f"Invalid or duplicate setting in {path}; use one KEY=value line per required key.")
+        if not separator:
+            raise SetupError(f"Invalid setting in {path}; use KEY=value format.")
+        if key not in ALL_ENV_KEYS or key in values:
+            raise SetupError(f"Invalid or duplicate setting in {path}; allowed keys are {', '.join(ALL_ENV_KEYS)}.")
         values[key] = value  # Never expand or interpret CMD metacharacters.
     if any(not values.get(key) for key in DB_KEYS):
         raise SetupError(f"Complete all five PostgreSQL settings in {path}.")
-    if values["PGPASSWORD"] == PLACEHOLDER:
+    if values.get("PGPASSWORD") == PLACEHOLDER:
         raise SetupError(f"Replace the PGPASSWORD placeholder in {path} with your password locally.")
-    if values["PGDATABASE"] != "container_port_flow":
+    if values.get("PGDATABASE") != "container_port_flow":
         raise SetupError("PGDATABASE must be container_port_flow for this project.")
-    if not values["PGPORT"].isdigit() or not 1 <= int(values["PGPORT"]) <= 65535:
+    if not values.get("PGPORT", "").isdigit() or not 1 <= int(values["PGPORT"]) <= 65535:
         raise SetupError("PGPORT must be a valid port number.")
     return values
 
