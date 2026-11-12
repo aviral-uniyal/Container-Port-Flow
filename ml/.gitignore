@@ -1,0 +1,3 @@
+# Offline experiment outputs are reproducible and are not approved for deployment.
+artifacts/
+.deps/
