@@ -5,6 +5,11 @@ import pandas as pd
 from .dataset import TIMESTAMP_FORMAT
 
 FEATURES = ("vessel", "month", "weekday")
+FEATURE_SETS = {
+    "calendar": ("month", "weekday"),
+    "vessel": ("vessel",),
+    "vessel_calendar": FEATURES,
+}
 
 
 def make_features(visits: pd.DataFrame) -> pd.DataFrame:

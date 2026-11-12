@@ -23,7 +23,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder
 
 from .dataset import CSV_PATH, TARGET, describe_target, load_visits
-from .features import FEATURES, make_features
+from .features import FEATURES, FEATURE_SETS, make_features
 
 DEFAULT_OUTPUT = Path(__file__).parent / "artifacts"
 SEED = 42
@@ -46,7 +46,7 @@ def chronological_splits(visits: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFra
     }
 
 
-def model(name: str) -> Pipeline:
+def model(name: str, features: tuple[str, ...] = FEATURES) -> Pipeline:
     estimators = {
         "median": DummyRegressor(strategy="median"),
         "ridge": Ridge(alpha=100.0),
@@ -58,7 +58,7 @@ def model(name: str) -> Pipeline:
     if name not in estimators:
         raise ValueError(f"Unknown model: {name}")
     preprocessing = ColumnTransformer([
-        ("categories", OneHotEncoder(handle_unknown="ignore"), list(FEATURES)),
+        ("categories", OneHotEncoder(handle_unknown="ignore"), list(features)),
     ])
     return Pipeline([("preprocess", preprocessing), ("regressor", estimators[name])])
 
@@ -90,32 +90,75 @@ def evaluate(fitted: Pipeline, reference: pd.DataFrame, holdout: pd.DataFrame) -
     return result
 
 
+def error_diagnostics(fitted: Pipeline, holdout: pd.DataFrame, outlier_threshold: float) -> dict:
+    """Describe errors by month and observed-duration outlier, without refitting."""
+    predicted = fitted.predict(make_features(holdout))
+    absolute = np.abs(predicted - holdout[TARGET].to_numpy())
+    outlier = holdout[TARGET].to_numpy() > outlier_threshold
+    by_month = {}
+    for month in sorted(holdout.ATB.dt.month.unique()):
+        mask = holdout.ATB.dt.month.to_numpy() == month
+        by_month[str(month)] = {"rows": int(mask.sum()), "mae_hours": float(absolute[mask].mean())}
+    return {
+        "duration_outliers": {"rows": int(outlier.sum()),
+                              "mae_hours": float(absolute[outlier].mean()) if outlier.any() else None},
+        "other_visits": {"rows": int((~outlier).sum()),
+                         "mae_hours": float(absolute[~outlier].mean()) if (~outlier).any() else None},
+        "by_atb_month": by_month,
+    }
+
+
 def run(path: Path = CSV_PATH, output: Path = DEFAULT_OUTPUT) -> dict:
     visits = load_visits(path)
     train, validation, test, split_report = chronological_splits(visits)
     validation_results = {}
-    for name in ("median", "ridge", "forest"):
-        fitted = model(name).fit(make_features(train), train[TARGET])
-        validation_results[name] = evaluate(fitted, train, validation)
+    baseline_validation = model("median").fit(make_features(train), train[TARGET])
+    validation_results["median"] = evaluate(baseline_validation, train, validation)
+    # Candidate order is fixed before looking at the 2021 holdout. Keep the
+    # original feature set as a direct point of comparison.
+    for feature_set, features in FEATURE_SETS.items():
+        for name in ("ridge", "forest"):
+            key = f"{feature_set}_{name}"
+            fitted = model(name, features).fit(make_features(train), train[TARGET])
+            validation_results[key] = evaluate(fitted, train, validation)
 
-    winner = min(validation_results, key=lambda name: validation_results[name]["all"]["mae_hours"])
+    winner = min(validation_results, key=lambda key: validation_results[key]["all"]["mae_hours"])
+    if winner == "median":
+        winner_features, winner_estimator = FEATURES, "median"
+    else:
+        feature_set, winner_estimator = winner.rsplit("_", 1)
+        winner_features = FEATURE_SETS[feature_set]
     pretest = pd.concat([train, validation]).sort_values("ATB")
     baseline = model("median").fit(make_features(pretest), pretest[TARGET])
-    selected = model(winner).fit(make_features(pretest), pretest[TARGET])
+    selected = model(winner_estimator, winner_features).fit(make_features(pretest), pretest[TARGET])
+    target_report = describe_target(visits)
+    diagnostic_outlier_threshold = describe_target(train)["far_outlier_threshold_hours"]
     report = {
         "status": "offline_experiment_only_not_approved_for_deployment",
         "target": "ATD minus ATB in hours; predicted at actual berthing",
-        "features": list(FEATURES),
+        "features": list(winner_features),
+        "feature_sets_compared": {key: list(value) for key, value in FEATURE_SETS.items()},
+        "not_evaluated": {
+            "operator_shipping_line": "Availability of per-visit codes at actual berthing is unconfirmed",
+            "other_pre_operation_inputs": "No further source field has confirmed pre-operation availability",
+        },
         "source_csv": str(path),
         "source_csv_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
-        "dataset": describe_target(visits),
+        "dataset": target_report,
         "split": split_report,
-        "selection_rule": "lowest validation MAE; ties keep median, then ridge, then forest",
+        "selection_rule": "lowest 2020 validation MAE in fixed candidate order; no 2021 selection",
         "validation": validation_results,
         "selected_model": winner,
         "test": {
             "median": evaluate(baseline, pretest, test),
             "selected": evaluate(selected, pretest, test),
+        },
+        "diagnostics": {
+            "outlier_threshold_from_2019_training_hours": diagnostic_outlier_threshold,
+            "validation": error_diagnostics(baseline_validation if winner == "median" else
+                                            model(winner_estimator, winner_features).fit(make_features(train), train[TARGET]),
+                                            validation, diagnostic_outlier_threshold),
+            "test": error_diagnostics(selected, test, diagnostic_outlier_threshold),
         },
         "training_period": "2019-01-01 through 2020-12-31, outcomes observed before 2021-01-01",
         "versions": {
