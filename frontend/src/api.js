@@ -203,6 +203,20 @@ export async function fetchInventory() {
   }
 }
 
+/** POST /predictions/berth-duration — read-only experimental estimate. */
+export async function requestBerthDuration(vesselName) {
+  try {
+    const res = await fetch('/predictions/berth-duration', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ vessel_name: vesselName }),
+    })
+    return handleResponse(res)
+  } catch {
+    return { ok: false, error: 'API unreachable' }
+  }
+}
+
 /**
  * POST /simulation/cranes/{craneId}/fail — mark a crane as FAILED.
  */

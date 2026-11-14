@@ -1,32 +1,18 @@
 import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
-import { after, before, test } from 'node:test'
+import { after, test } from 'node:test'
 import React from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { createServer } from 'vite'
 import { dispatchBatch, resetSimulation } from '../src/api.js'
 
-let server
-let App
-let JobsTable
-let StatusBar
-let dispatchFeedback
-let blockedExecutionFeedback
-let executionStatusLabel
-let stabilizeJobOrder
-let insertJobOrder
-let previewJobOrder
-let stepFeedback
-
-before(async () => {
-  server = await createServer({ server: { middlewareMode: true }, appType: 'custom' })
-  ;({ blockedExecutionFeedback, dispatchFeedback, executionStatusLabel,
-    insertJobOrder, previewJobOrder, stabilizeJobOrder, stepFeedback } =
-    await server.ssrLoadModule('/src/uiLogic.js'))
-  ;({ default: App } = await server.ssrLoadModule('/src/App.jsx'))
-  ;({ default: JobsTable } = await server.ssrLoadModule('/src/components/JobsTable.jsx'))
-  ;({ default: StatusBar } = await server.ssrLoadModule('/src/components/StatusBar.jsx'))
-})
+const server = await createServer({ server: { middlewareMode: true, hmr: false }, appType: 'custom' })
+const { blockedExecutionFeedback, dispatchFeedback, executionStatusLabel,
+  insertJobOrder, previewJobOrder, stabilizeJobOrder, stepFeedback } =
+  await server.ssrLoadModule('/src/uiLogic.js')
+const { default: App } = await server.ssrLoadModule('/src/App.jsx')
+const { default: JobsTable } = await server.ssrLoadModule('/src/components/JobsTable.jsx')
+const { default: StatusBar } = await server.ssrLoadModule('/src/components/StatusBar.jsx')
 
 after(async () => {
   await server?.close()

@@ -6,6 +6,7 @@ import JobForm          from './components/JobForm'
 import JobsTable        from './components/JobsTable'
 import CraneRegistry    from './components/CraneRegistry'
 import DatabaseInventory from './components/DatabaseInventory'
+import Predictions from './components/Predictions'
 import {
   blockedExecutionFeedback,
   dispatchFeedback,
@@ -528,6 +529,9 @@ export default function App() {
           <button type="button" className={`app-header__tab${activeTab === 'inventory' ? ' app-header__tab--active' : ''}`}
             aria-current={activeTab === 'inventory' ? 'page' : undefined} aria-controls="inventory-view"
             onClick={() => setActiveTab('inventory')}>Inventory</button>
+          <button type="button" className={`app-header__tab${activeTab === 'predictions' ? ' app-header__tab--active' : ''}`}
+            aria-current={activeTab === 'predictions' ? 'page' : undefined} aria-controls="predictions-view"
+            onClick={() => setActiveTab('predictions')}>Predictions</button>
         </nav>
         <div className="app-header__actions">
           <button
@@ -653,6 +657,10 @@ export default function App() {
             loading={inventoryLoading}
             error={inventoryError}
           />
+        </div>
+
+        <div id="predictions-view" className="app-main__view" hidden={activeTab !== 'predictions'}>
+          <Predictions ships={inventory?.ships} />
         </div>
 
       </main>

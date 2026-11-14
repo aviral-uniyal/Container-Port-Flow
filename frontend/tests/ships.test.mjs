@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
-import { after, before, test } from 'node:test'
+import { after, test } from 'node:test'
 import React from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { createServer } from 'vite'
@@ -12,24 +12,12 @@ const ships = [
   { ship_id: 13, vessel_name: 'Atlantic Sun', status: 'COMPLETED & LEFT' },
 ]
 
-let server
-let JobForm
-let DatabaseInventory
-let filterInventoryShips
-let matchingShips
-let selectableShips
-let nextShipIndex
-let submittedShipSelection
-let clearSubmittedShip
-
-before(async () => {
-  server = await createServer({ server: { middlewareMode: true }, appType: 'custom' })
-  ;({ default: JobForm, clearSubmittedShip, matchingShips, selectableShips,
-    nextShipIndex, submittedShipSelection } =
-    await server.ssrLoadModule('/src/components/JobForm.jsx'))
-  ;({ default: DatabaseInventory, filterInventoryShips } =
-    await server.ssrLoadModule('/src/components/DatabaseInventory.jsx'))
-})
+const server = await createServer({ server: { middlewareMode: true, hmr: false }, appType: 'custom' })
+const { default: JobForm, clearSubmittedShip, matchingShips, selectableShips,
+  nextShipIndex, submittedShipSelection } =
+  await server.ssrLoadModule('/src/components/JobForm.jsx')
+const { default: DatabaseInventory, filterInventoryShips } =
+  await server.ssrLoadModule('/src/components/DatabaseInventory.jsx')
 
 after(async () => { await server?.close() })
 

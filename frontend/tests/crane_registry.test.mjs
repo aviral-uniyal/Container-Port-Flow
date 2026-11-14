@@ -1,22 +1,15 @@
 import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
-import { after, before, test } from 'node:test'
+import { after, test } from 'node:test'
 import React from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { createServer } from 'vite'
 import { recoverCrane, registerCrane } from '../src/api.js'
 
-let server
-let CraneRegistry
-let App
-let stabilizeCraneOrder
-
-before(async () => {
-  server = await createServer({ server: { middlewareMode: true }, appType: 'custom' })
-  ;({ default: CraneRegistry } = await server.ssrLoadModule('/src/components/CraneRegistry.jsx'))
-  ;({ default: App } = await server.ssrLoadModule('/src/App.jsx'))
-  ;({ stabilizeCraneOrder } = await server.ssrLoadModule('/src/uiLogic.js'))
-})
+const server = await createServer({ server: { middlewareMode: true, hmr: false }, appType: 'custom' })
+const { default: CraneRegistry } = await server.ssrLoadModule('/src/components/CraneRegistry.jsx')
+const { default: App } = await server.ssrLoadModule('/src/App.jsx')
+const { stabilizeCraneOrder } = await server.ssrLoadModule('/src/uiLogic.js')
 
 after(async () => {
   await server?.close()
