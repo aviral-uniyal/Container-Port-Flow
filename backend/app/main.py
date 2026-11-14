@@ -21,6 +21,7 @@ from fastapi import FastAPI
 from .cpp_bridge import CppBridge, CppBridgeError
 from .database import DatabasePool, get_connection, initialize_backend_inventory
 from .execution import SimulationExecution
+from .predictions import router as predictions_router
 from .router import router
 
 logger = logging.getLogger(__name__)
@@ -84,3 +85,4 @@ app = FastAPI(
 )
 
 app.include_router(router)
+app.include_router(predictions_router)

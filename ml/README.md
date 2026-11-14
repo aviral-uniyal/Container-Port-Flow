@@ -57,6 +57,60 @@ another vessel or silently given a generic forecast. Load joblib files only
 from a trusted local training run; a checksum detects accidental mismatch but
 does not make an untrusted pickle safe.
 
+## Experimental read-only FastAPI endpoint
+
+`POST /predictions/berth-duration` calls that same offline
+`predict_duration(vessel_name)` function through a separate FastAPI router.
+Send a JSON body with an exact historical vessel name:
+
+```json
+{"vessel_name": "ALS APOLLO"}
+```
+
+A successful response has this shape (the estimate and UTC timestamp below
+are illustrative; each request generates its own timestamp):
+
+```json
+{
+  "designation": "experimental_advisory",
+  "status": "available",
+  "vessel_name": "ALS APOLLO",
+  "estimated_duration_hours": 20.59,
+  "units": "hours",
+  "model_version": "vessel_forest:9aab51460095",
+  "training_period": "2019-01-01 through 2020-12-31, outcomes observed before 2021-01-01",
+  "predicted_at": "2026-11-14T00:00:00+00:00",
+  "prediction_moment": "actual berthing",
+  "explanation": "Historical vessel-based estimate of berth-to-departure duration; actual duration may differ.",
+  "reason": null
+}
+```
+
+For a valid vessel name absent from training, the endpoint returns HTTP 200
+with `status: "unavailable"`, `reason: "unseen_vessel"`, and
+`estimated_duration_hours: null`. Missing or malformed request fields return
+HTTP 422. A fresh clone has no generated model; with inference packages
+installed, the endpoint returns `reason: "missing_model_artifact"` until
+`python -m ml.experiment` is run locally. If packages are missing, it returns
+`reason: "ml_dependencies_unavailable"`. An unexpected inference failure
+returns `reason: "prediction_failed"`. The API does not train on startup.
+
+Install runtime inference packages into the backend's Python environment with
+`python -m pip install -r ml/requirements-inference.txt` from the repository
+root. That file pins the versions used for the current artifact. The existing
+`ml/requirements.txt` also includes pytest for training and offline tests.
+`ML_ARTIFACT_DIR` may point to a trusted local directory containing both
+`metadata.json` and `berth_duration_pipeline.joblib`; otherwise the default is
+`ml/artifacts/`. The generated files remain ignored by Git. The router imports
+ML only when requested, so missing ML packages or artifacts do not prevent
+FastAPI from importing or serving existing endpoints.
+
+This endpoint does not read or write PostgreSQL, call the C++ bridge, submit
+jobs, change priorities, or allocate resources. Its historical duration hours
+must never be used as simulation work units. It is not an upcoming disruption
+forecast: the dataset has no validated labels for that task. The 2019–2021
+model is still experimental and not approved for operational decisions.
+
 The experiment compares a historical median with Ridge regression and a small random forest for each feature set. It trains on 2019, selects by 2020 validation MAE, refits on eligible 2019–2020 visits, then tests the selected candidate and baseline once on 2021. Visits crossing a training cutoff are excluded from that period and counted, because their outcomes were not yet observed. Preprocessing is fitted inside each training pipeline. The report includes MAE, median and 90th-percentile absolute error, RMSE, signed-error quantiles, repeated/unseen vessel groups, and descriptive errors by month and duration outlier. The fixed random seed is 42.
 
 `ml/artifacts/metadata.json` records results, feature and target definitions, training period, and dependency versions. `ml/artifacts/berth_duration_pipeline.joblib` contains fitted preprocessing and estimator together. Both are ignored by Git. Only load locally created, trusted joblib files. A saved model is **not** approved for deployment merely because training succeeded.
