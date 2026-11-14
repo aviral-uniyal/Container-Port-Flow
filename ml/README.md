@@ -19,6 +19,44 @@ python -m ml.experiment
 python -m ml.disruption_audit
 ```
 
+Run `python -m ml.experiment` before offline inference whenever the generated
+artifacts are absent or the training code changes. The saved artifact and its
+metadata are created together. With the current source and dependencies, the
+selected model is `vessel_forest`, the saved feature schema is `["vessel"]`,
+and the CSV SHA-256 is
+`60fe343827c6f20f9b6e0b98364fe570e37aa993d843dc65bf234caddfe2493b`.
+The metadata records the model artifact SHA-256 and a version label derived
+from it. Repeating this training run produced the same artifact checksum and
+the same validation/test metrics. The pipeline and model are one joblib file.
+
+## Offline prediction interface
+
+The single inference entry point is `ml.inference.predict_duration(vessel_name)`.
+Call it only after **actual berthing begins**. The selected vessel-only model
+requires an exact historical vessel name; it does not use ATB or any calendar
+field, so the function does not ask for a timestamp. It returns a dictionary
+with `status` (`available` or `unavailable`), `vessel_name`,
+`estimated_duration_hours`, `units`, `model_version`, `training_period`,
+`predicted_at` (UTC, only for an available estimate), `prediction_moment`,
+`explanation`, and `reason`. An estimate describes historical berth-to-departure
+duration, not a guaranteed departure time, disruption forecast, or simulation
+work unit. No confidence percentage or interval is produced.
+
+For an offline check from the repository root after training:
+
+```powershell
+python -c "from ml.inference import predict_duration; print(predict_duration('ALS APOLLO'))"
+```
+
+The predictor validates the metadata, dependency version, artifact checksum,
+fitted feature schema, and trained vessel vocabulary. Missing or invalid
+vessel names, unseen vessels, missing or damaged artifacts, incompatible
+metadata or schema, and load/prediction failures return `unavailable` with an
+explicit reason and no numeric estimate. An unseen vessel is never replaced by
+another vessel or silently given a generic forecast. Load joblib files only
+from a trusted local training run; a checksum detects accidental mismatch but
+does not make an untrusted pickle safe.
+
 The experiment compares a historical median with Ridge regression and a small random forest for each feature set. It trains on 2019, selects by 2020 validation MAE, refits on eligible 2019–2020 visits, then tests the selected candidate and baseline once on 2021. Visits crossing a training cutoff are excluded from that period and counted, because their outcomes were not yet observed. Preprocessing is fitted inside each training pipeline. The report includes MAE, median and 90th-percentile absolute error, RMSE, signed-error quantiles, repeated/unseen vessel groups, and descriptive errors by month and duration outlier. The fixed random seed is 42.
 
 `ml/artifacts/metadata.json` records results, feature and target definitions, training period, and dependency versions. `ml/artifacts/berth_duration_pipeline.joblib` contains fitted preprocessing and estimator together. Both are ignored by Git. Only load locally created, trusted joblib files. A saved model is **not** approved for deployment merely because training succeeded.

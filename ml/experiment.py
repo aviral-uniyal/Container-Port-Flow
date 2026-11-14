@@ -63,6 +63,10 @@ def model(name: str, features: tuple[str, ...] = FEATURES) -> Pipeline:
     return Pipeline([("preprocess", preprocessing), ("regressor", estimators[name])])
 
 
+def fitted_features(fitted: Pipeline) -> tuple[str, ...]:
+    return tuple(fitted.named_steps["preprocess"].feature_names_in_)
+
+
 def metrics(y: pd.Series, predicted: np.ndarray) -> dict:
     error = np.asarray(predicted) - np.asarray(y)
     absolute = np.abs(error)
@@ -79,7 +83,7 @@ def metrics(y: pd.Series, predicted: np.ndarray) -> dict:
 
 
 def evaluate(fitted: Pipeline, reference: pd.DataFrame, holdout: pd.DataFrame) -> dict:
-    predictions = fitted.predict(make_features(holdout))
+    predictions = fitted.predict(make_features(holdout, fitted_features(fitted)))
     known = holdout["Vessel Name"].isin(set(reference["Vessel Name"]))
     result = {"all": metrics(holdout[TARGET], predictions)}
     for label, mask in (("repeated_vessel", known), ("unseen_vessel", ~known)):
@@ -92,7 +96,7 @@ def evaluate(fitted: Pipeline, reference: pd.DataFrame, holdout: pd.DataFrame) -
 
 def error_diagnostics(fitted: Pipeline, holdout: pd.DataFrame, outlier_threshold: float) -> dict:
     """Describe errors by month and observed-duration outlier, without refitting."""
-    predicted = fitted.predict(make_features(holdout))
+    predicted = fitted.predict(make_features(holdout, fitted_features(fitted)))
     absolute = np.abs(predicted - holdout[TARGET].to_numpy())
     outlier = holdout[TARGET].to_numpy() > outlier_threshold
     by_month = {}
@@ -119,7 +123,7 @@ def run(path: Path = CSV_PATH, output: Path = DEFAULT_OUTPUT) -> dict:
     for feature_set, features in FEATURE_SETS.items():
         for name in ("ridge", "forest"):
             key = f"{feature_set}_{name}"
-            fitted = model(name, features).fit(make_features(train), train[TARGET])
+            fitted = model(name, features).fit(make_features(train, features), train[TARGET])
             validation_results[key] = evaluate(fitted, train, validation)
 
     winner = min(validation_results, key=lambda key: validation_results[key]["all"]["mae_hours"])
@@ -130,7 +134,7 @@ def run(path: Path = CSV_PATH, output: Path = DEFAULT_OUTPUT) -> dict:
         winner_features = FEATURE_SETS[feature_set]
     pretest = pd.concat([train, validation]).sort_values("ATB")
     baseline = model("median").fit(make_features(pretest), pretest[TARGET])
-    selected = model(winner_estimator, winner_features).fit(make_features(pretest), pretest[TARGET])
+    selected = model(winner_estimator, winner_features).fit(make_features(pretest, winner_features), pretest[TARGET])
     target_report = describe_target(visits)
     diagnostic_outlier_threshold = describe_target(train)["far_outlier_threshold_hours"]
     report = {
@@ -156,7 +160,7 @@ def run(path: Path = CSV_PATH, output: Path = DEFAULT_OUTPUT) -> dict:
         "diagnostics": {
             "outlier_threshold_from_2019_training_hours": diagnostic_outlier_threshold,
             "validation": error_diagnostics(baseline_validation if winner == "median" else
-                                            model(winner_estimator, winner_features).fit(make_features(train), train[TARGET]),
+                                            model(winner_estimator, winner_features).fit(make_features(train, winner_features), train[TARGET]),
                                             validation, diagnostic_outlier_threshold),
             "test": error_diagnostics(selected, test, diagnostic_outlier_threshold),
         },
@@ -172,7 +176,10 @@ def run(path: Path = CSV_PATH, output: Path = DEFAULT_OUTPUT) -> dict:
         "random_seed": SEED,
     }
     output.mkdir(parents=True, exist_ok=True)
-    joblib.dump(selected, output / "berth_duration_pipeline.joblib")
+    artifact = output / "berth_duration_pipeline.joblib"
+    joblib.dump(selected, artifact)
+    report["model_sha256"] = hashlib.sha256(artifact.read_bytes()).hexdigest()
+    report["model_version"] = f"{winner}:{report['model_sha256'][:12]}"
     (output / "metadata.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     return report
 
